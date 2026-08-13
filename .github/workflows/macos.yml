@@ -41,7 +41,18 @@ jobs:
       - name: Build the shim
         run: cargo build --release
 
+      # MUST come before any test. A clean runner has no Postgres binaries, and
+      # the shim fails discovery with a bare `Init("")` — six tests failing in
+      # 0.00s, which looks like a catastrophic port failure and is nothing of
+      # the sort. Locally this is invisible because pg-install/ is already
+      # provisioned and gitignored.
+      - name: Provision Postgres binaries
+        run: scripts/bootstrap-pg.sh rustypglite-sys/pg-install
+
       - name: Rust tests
+        env:
+          RUSTYPGLITE_PG_DIR: ${{ github.workspace }}/rustypglite-sys/pg-install
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/rustypglite-sys/pg-install/lib
         run: cargo test --release
 
       # Downloads the darwin Postgres binaries, strips quarantine, ad-hoc signs
@@ -63,10 +74,14 @@ jobs:
       # on Apple Silicon? This is where a fork-safety problem would surface.
       - name: .NET tests (starts a real embedded Postgres)
         working-directory: rustypglite-csharp
+        env:
+          RUSTYPGLITE_PG_DIR: ${{ github.workspace }}/rustypglite-sys/pg-install
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/rustypglite-sys/pg-install/lib
         run: dotnet test -c Release
 
+      # Only on success: uploading on failure just turns a real error into a
+      # second, misleading one about a missing artifact.
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: librustypglite-osx-arm64
           path: runtimes/osx-arm64/native/librustypglite.dylib
