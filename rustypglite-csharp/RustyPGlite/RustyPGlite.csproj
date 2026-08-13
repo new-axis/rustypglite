@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>RustyPGlite</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>RustyPGlite Contributors</Authors>
+    <Description>Embedded PostgreSQL for .NET — real Postgres, no server process, no Docker</Description>
+    <PackageTags>postgres;postgresql;embedded;database;testing</PackageTags>
+    <!-- SPDX expression, matching Cargo.toml. An expression rather than a packed
+         file so the declarations here, in Cargo.toml, and in the LICENSE-* files
+         cannot drift apart. -->
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!--
+    NATIVE LIBRARY, PER RID.
+
+    The directory names here are .NET RUNTIME IDENTIFIERS (linux-x64, osx-arm64,
+    …) because that is what NuGet's native-asset resolution matches on.
+    scripts/bundle.sh writes them under exactly these names for the same reason —
+    a uname-shaped name like `darwin-arm64` is one no RID resolver looks for, so
+    a correctly built dylib in a correctly built package still fails to load.
+
+    EACH BLOCK IS CONDITIONED ON THE FILE EXISTING. linux-x64 is committed so
+    consumers can build without a Rust toolchain; the others are produced by
+    whoever builds on that platform — and a listed-but-absent native asset fails
+    the copy and takes the whole build down, which is what stopped this project
+    building on a Mac at all. A build host packs the artifacts it actually has;
+    a release carrying several RIDs runs bundle.sh once per platform.
+  -->
+  <ItemGroup Condition="Exists('runtimes/linux-x64/native/librustypglite.so')">
+    <None Include="runtimes/linux-x64/native/librustypglite.so"
+          Pack="true" PackagePath="runtimes/linux-x64/native/"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="librustypglite.so" />
+    <ContentWithTargetPath Include="runtimes/linux-x64/native/librustypglite.so"
+                           TargetPath="librustypglite.so"
+                           CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('runtimes/linux-arm64/native/librustypglite.so')">
+    <None Include="runtimes/linux-arm64/native/librustypglite.so"
+          Pack="true" PackagePath="runtimes/linux-arm64/native/"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="librustypglite.so" />
+    <ContentWithTargetPath Include="runtimes/linux-arm64/native/librustypglite.so"
+                           TargetPath="librustypglite.so"
+                           CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('runtimes/osx-arm64/native/librustypglite.dylib')">
+    <None Include="runtimes/osx-arm64/native/librustypglite.dylib"
+          Pack="true" PackagePath="runtimes/osx-arm64/native/"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="librustypglite.dylib" />
+    <ContentWithTargetPath Include="runtimes/osx-arm64/native/librustypglite.dylib"
+                           TargetPath="librustypglite.dylib"
+                           CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('runtimes/osx-x64/native/librustypglite.dylib')">
+    <None Include="runtimes/osx-x64/native/librustypglite.dylib"
+          Pack="true" PackagePath="runtimes/osx-x64/native/"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="librustypglite.dylib" />
+    <ContentWithTargetPath Include="runtimes/osx-x64/native/librustypglite.dylib"
+                           TargetPath="librustypglite.dylib"
+                           CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

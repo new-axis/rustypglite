@@ -1,0 +1,73 @@
+# Does this actually work on a Mac?
+#
+# The macOS port was written without access to Apple hardware, so every claim in
+# it is correct-by-construction rather than observed. This workflow exists to
+# convert that into a fact — and it deliberately RUNS things rather than only
+# building them, because the one risk that could not be designed away is
+# runtime: the shim forks and execs a real postgres, and Apple's rules for
+# forking a threaded process are stricter than Linux's.
+#
+# A green compile here would prove almost nothing. A green `cargo test` and
+# `dotnet test` prove the thing we care about.
+
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    # macos-14 and later are Apple Silicon, which is the RID we actually need
+    # (osx-arm64). Do not "simplify" this to macos-latest without checking what
+    # that alias points at — an x64 runner silently produces the wrong artifact.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          uname -sm
+          rustc --version
+          cargo --version
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build the shim
+        run: cargo build --release
+
+      - name: Rust tests
+        run: cargo test --release
+
+      # Downloads the darwin Postgres binaries, strips quarantine, ad-hoc signs
+      # the dylib, and writes runtimes/osx-arm64/native/ — the RID directory the
+      # csproj packs from.
+      - name: Bundle
+        run: scripts/bundle.sh
+
+      - name: Confirm the artifact is where NuGet will look for it
+        run: |
+          test -f runtimes/osx-arm64/native/librustypglite.dylib \
+            || { echo "no dylib at the osx-arm64 RID path"; exit 1; }
+          file runtimes/osx-arm64/native/librustypglite.dylib
+          test -x runtimes/osx-arm64/native/pg/bin/postgres \
+            || { echo "bundled postgres missing or not executable"; exit 1; }
+          runtimes/osx-arm64/native/pg/bin/postgres --version
+
+      # THE ACTUAL QUESTION: does starting a real Postgres through the shim work
+      # on Apple Silicon? This is where a fork-safety problem would surface.
+      - name: .NET tests (starts a real embedded Postgres)
+        working-directory: rustypglite-csharp
+        run: dotnet test -c Release
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: librustypglite-osx-arm64
+          path: runtimes/osx-arm64/native/librustypglite.dylib
+          if-no-files-found: error

@@ -1,0 +1,13 @@
+[package]
+name = "rustypglite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded PostgreSQL server — real Postgres, managed lifecycle, zero infrastructure"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rustypglite-sys = { path = "../rustypglite-sys" }
+thiserror = "2"

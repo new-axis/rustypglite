@@ -1,0 +1,25 @@
+{
+  "name": "rustypglite",
+  "version": "0.1.0",
+  "description": "Embedded PostgreSQL server for Node.js — real Postgres, zero infrastructure",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "postinstall": "bash scripts/download-pg.sh",
+    "build": "tsc",
+    "test": "tsx --test src/test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["postgres", "postgresql", "embedded", "database", "testing", "pglite"],
+  "license": "MIT",
+  "dependencies": {
+    "koffi": "^2"
+  },
+  "devDependencies": {
+    "pg": "^8",
+    "@types/pg": "^8",
+    "typescript": "^5",
+    "tsx": "^4"
+  }
+}

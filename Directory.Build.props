@@ -1,0 +1,15 @@
+<Project>
+
+  <!--
+    Build boundary. RustyPGlite is consumed as a git submodule nested inside
+    host repos that define their own strict analyzer stack at their root. MSBuild applies the NEAREST
+    Directory.Build.props walking up from a project, then stops — so this file
+    halts that walk at the RustyPGlite root. RustyPGlite therefore builds with
+    its own settings and does NOT inherit a host repo's
+    StyleCop / Meziantou / TreatWarningsAsErrors configuration.
+  -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>
