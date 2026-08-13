@@ -61,14 +61,20 @@ jobs:
       - name: Bundle
         run: scripts/bundle.sh
 
+      # The RID tree lives beside the CSPROJ, not at the repo root — that is the
+      # whole point of bundle.sh writing there rather than into dist/, so no
+      # human has to remember a copy step. Assert the path the packaging
+      # actually uses.
       - name: Confirm the artifact is where NuGet will look for it
+        env:
+          RID_DIR: rustypglite-csharp/RustyPGlite/runtimes/osx-arm64/native
         run: |
-          test -f runtimes/osx-arm64/native/librustypglite.dylib \
-            || { echo "no dylib at the osx-arm64 RID path"; exit 1; }
-          file runtimes/osx-arm64/native/librustypglite.dylib
-          test -x runtimes/osx-arm64/native/pg/bin/postgres \
+          test -f "$RID_DIR/librustypglite.dylib" \
+            || { echo "no dylib at $RID_DIR"; exit 1; }
+          file "$RID_DIR/librustypglite.dylib"
+          test -x "$RID_DIR/pg/bin/postgres" \
             || { echo "bundled postgres missing or not executable"; exit 1; }
-          runtimes/osx-arm64/native/pg/bin/postgres --version
+          "$RID_DIR/pg/bin/postgres" --version
 
       # THE ACTUAL QUESTION: does starting a real Postgres through the shim work
       # on Apple Silicon? This is where a fork-safety problem would surface.
@@ -84,5 +90,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: librustypglite-osx-arm64
-          path: runtimes/osx-arm64/native/librustypglite.dylib
+          path: rustypglite-csharp/RustyPGlite/runtimes/osx-arm64/native/librustypglite.dylib
           if-no-files-found: error
