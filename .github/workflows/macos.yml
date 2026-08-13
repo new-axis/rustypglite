@@ -78,12 +78,14 @@ jobs:
 
       # THE ACTUAL QUESTION: does starting a real Postgres through the shim work
       # on Apple Silicon? This is where a fork-safety problem would surface.
+      # Name the test PROJECT: rustypglite-csharp/ holds two project directories
+      # and no .sln, so `dotnet test` there fails with MSB1003 before it gets
+      # anywhere near a database.
       - name: .NET tests (starts a real embedded Postgres)
-        working-directory: rustypglite-csharp
         env:
           RUSTYPGLITE_PG_DIR: ${{ github.workspace }}/rustypglite-sys/pg-install
           DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/rustypglite-sys/pg-install/lib
-        run: dotnet test -c Release
+        run: dotnet test rustypglite-csharp/RustyPGlite.Tests/RustyPGlite.Tests.csproj -c Release
 
       # Only on success: uploading on failure just turns a real error into a
       # second, misleading one about a missing artifact.
