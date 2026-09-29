@@ -61,7 +61,8 @@ typedef struct rpgl_sweep_result {
     int examined;   /* rpgl_* dirs looked at */
     int reclaimed;  /* owner and watchdog dead: server stopped, dir removed */
     int live;       /* owner (or its watchdog) still running: left alone */
-    int durable;    /* marked durable: left alone */
+    int durable;    /* an rpgl_* dir whose owner.json says durable: left alone.  Normally
+                       0 — durable auto dirs are rpgldur_*, which no sweep examines */
     int legacy;     /* no owner.json (older rustypglite, or mid-start): left alone */
     int skipped;    /* not ours to judge (other user, other PID namespace, unreadable) */
     int failed;     /* owner dead, but the server would not stop or the dir stay removed */

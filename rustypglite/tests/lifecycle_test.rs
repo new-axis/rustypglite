@@ -553,9 +553,70 @@ fn a_changed_boot_id_alone_does_not_make_a_live_owner_dead() {
     );
 
     let report = rustypglite::sweep(Some(root.path())).unwrap().expect("not busy");
-    assert_eq!(report.reclaimed, 0, "{:?}", report);
-    assert!(other_boot.exists(), "a live owner's dir was reclaimed over a boot id");
+    if cfg!(target_os = "linux") {
+        // Linux start times are ticks since boot, so across boots they are not
+        // comparable: a matching one under a different boot_id (which never
+        // moves) is a coincidence, and the owner is dead.
+        assert_eq!(report.reclaimed, 1, "{:?}", report);
+        assert!(!other_boot.exists(), "a pre-reboot dir must not leak");
+    } else {
+        // macOS start times are absolute, and the boot id must never decide alone.
+        assert_eq!(report.reclaimed, 0, "{:?}", report);
+        assert!(other_boot.exists(), "a live owner's dir was reclaimed over a boot id");
+    }
     drop(live);
+}
+
+#[test]
+fn a_stale_postmaster_pid_naming_someone_elses_process_does_not_block_a_start() {
+    // After a reboot or crash, postmaster.pid can name a PID that now belongs
+    // to another user (here: init). That is not our server.
+    let root = Root::new("stalepid");
+    let dir = root.0.join("data");
+    let dir_s = dir.to_str().unwrap().to_string();
+    let opts = || StartOptions {
+        data_dir: Some(dir_s.clone()),
+        temp_root: Some(root.path().to_string()),
+        silent: true,
+        ..Default::default()
+    };
+    EmbeddedPg::start_with(opts()).expect("first start").stop();
+    std::fs::write(dir.join("postmaster.pid"), format!("1
+{}
+0
+5432
+{}
+", dir_s, dir_s)).unwrap();
+
+    let pg = EmbeddedPg::start_with(opts()).expect("a stale postmaster.pid must not block the start");
+    pg.exec_sql("SELECT 1").expect("serving");
+    pg.stop();
+}
+
+#[test]
+fn two_starts_racing_on_one_data_dir_leave_exactly_one_server_running() {
+    let root = Root::new("race");
+    let dir = root.0.join("data").to_str().unwrap().to_string();
+    let rootp = root.path().to_string();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let (dir, rootp, barrier) = (dir.clone(), rootp.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                EmbeddedPg::start_with(StartOptions {
+                    data_dir: Some(dir),
+                    temp_root: Some(rootp),
+                    silent: true,
+                    ..Default::default()
+                })
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let winners: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+    assert_eq!(winners.len(), 1, "exactly one start wins");
+    winners[0].exec_sql("SELECT 1").expect("the winner's server survived the loser's failure");
 }
 
 #[test]

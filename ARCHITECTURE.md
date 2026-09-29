@@ -240,17 +240,23 @@ a process whose cwd is that data dir, so a stale pidfile whose PID has been
 reused never gets a signal sent to the wrong process.
 
 **Owner checks.** A PID and its start time decide whether an owner is alive.
-The boot id never does on its own: a PID whose start time still matches is
-alive, whatever the boot id says. (On macOS the boot id is
-`kern.bootsessionuuid`, not `kern.boottime`, which moves when the clock is
-stepped.) On macOS, as on Linux, a postmaster is recognised by its cwd being
+On macOS the boot id never decides on its own: start times there are
+absolute, and the boot id is `kern.bootsessionuuid` (not `kern.boottime`,
+which moves when the clock is stepped). On Linux start times are ticks since
+boot, so across a reboot an equal one is a coincidence: there a different
+`boot_id` (a random UUID per boot, which never moves) makes the owner dead
+even when PID and start time match. On macOS, as on Linux, a postmaster is recognised by its cwd being
 the data dir (`proc_pidinfo(PROC_PIDVNODEPATHINFO)`), so a stale
 `postmaster.pid` whose PID was reused never gets a signal. The shim only ever
 `waitpid()`s a postmaster it forked itself.
 
 **Starting on an occupied dir** returns `RPGL_ERR_ALREADY` before touching
 anything — not its `owner.json`, not its server. Otherwise a failed start's
-clean-up would stop the server that was already there.
+clean-up would stop the server that was already there. A supplied data dir is
+`flock`ed for the whole start, so two starts racing on it cannot both get
+past that check. A `postmaster.pid` naming a process we may not signal
+(EPERM — after a reboot it can be root's) is stale, as Postgres itself
+treats it: our postmasters always run as us.
 
 **fork() without exec.** A `pthread_atfork` child handler makes the child
 forget the parent's instances (so its `exit()` does not stop them) and close
@@ -281,9 +287,8 @@ exceptional one.
   watchdog leaves an empty `rpgl_*` dir with no `owner.json` — "legacy" to
   the sweep, which never deletes those. So does an initdb orphaned by a dead
   owner that outlasts the watchdog's retries. Both hold no process.
-- Two processes starting on the same supplied `data_dir` at the same instant
-  can both pass the "already running" check; the loser's clean-up may then
-  stop the winner.
+- The sweep's `durable` count is normally 0: durable auto dirs are
+  `rpgldur_*`, which no sweep examines.
 
 3. **`rpgl_exec_sql()` / `rpgl_create_database()`**
    - Shells out to `psql` / `createdb` for setup operations

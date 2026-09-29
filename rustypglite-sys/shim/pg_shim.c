@@ -717,16 +717,23 @@ static int process_state(long pid, const char *start, const char *boot, const ch
     if (rc == -1) return PROC_DEAD;
     if (rc != 0) return PROC_UNKNOWN;
     /*
-     * PID and start time match: alive, whatever the boot id says.  A boot id
-     * that differs is only a tie-breaker, never the verdict on its own — if
-     * it is ever derived from something that moves (as kern.boottime does),
-     * trusting it alone would have a sweep stop a live server.
+     * PID and start time match: alive.  The boot id alone never decides —
+     * on macOS it was once derived from kern.boottime, which moves when the
+     * clock is stepped, and start times there are absolute anyway.
      */
-    if (strcmp(start, cur_start) == 0) return PROC_ALIVE;
-    /*
-     * Same PID, different start time: the PID was reused (or, across a
-     * reboot, the start times are not even comparable).  The owner is gone.
-     */
+    if (strcmp(start, cur_start) == 0) {
+#if defined(__linux__)
+        /*
+         * Except on Linux across a reboot: start times there are ticks since
+         * boot, so under a different boot_id (a random UUID per boot, which
+         * never moves) an equal one is a coincidence — early-boot PIDs and
+         * their start ticks repeat.  The owner is gone.
+         */
+        if (boot[0] && cur_boot[0] && strcmp(boot, cur_boot) != 0) return PROC_DEAD;
+#endif
+        return PROC_ALIVE;
+    }
+    /* Same PID, different start time: the PID was reused.  The owner is gone. */
     (void)boot; (void)cur_boot;
     return PROC_DEAD;
 }
@@ -753,7 +760,13 @@ static pid_t postmaster_pid(const char *dir) {
  */
 static int is_postmaster_of(pid_t pid, const char *dir) {
     if (pid <= 0) return 0;
-    if (kill(pid, 0) != 0 && errno == ESRCH) return 0;
+    /*
+     * ESRCH: no such process.  EPERM: another user's — and a postmaster we
+     * (or anyone we could stop) started runs as us.  Either way not ours:
+     * this is how Postgres itself reads a stale postmaster.pid, which after a
+     * reboot or crash can name a PID now owned by root.
+     */
+    if (kill(pid, 0) != 0) return 0;
     char real[PATH_MAX];
 #if defined(__linux__)
     char link[64], cwd[PATH_MAX];
@@ -1169,7 +1182,7 @@ int rpgl_stop_dir(const char *data_dir) {
 
 /* ---- Public API ---- */
 
-int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
+static int start_impl(const rpgl_options *opts, rpgl_instance **out, int *dir_lock) {
     if (!out) return RPGL_ERR_INIT;
 
     const char *temp_root = temp_root_for(opts);
@@ -1196,6 +1209,21 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
 
     /* ── Data directory ── */
     if (opts && opts->data_dir) {
+        /*
+         * Hold an exclusive lock on the dir for the whole start, so two
+         * starts racing on it cannot both pass the check below — and the
+         * loser's failure path cannot stop the winner's server.  Created if
+         * missing (initdb accepts an existing empty dir); close-on-exec, so
+         * neither pg_ctl nor postgres inherits it.
+         */
+        mkdir(opts->data_dir, 0700);
+        *dir_lock = open(opts->data_dir, O_RDONLY | O_CLOEXEC);
+        if (*dir_lock < 0 || flock(*dir_lock, LOCK_EX | LOCK_NB) != 0) {
+            free(inst->pg_bin_dir);
+            free(inst->db_name);
+            free(inst);
+            return RPGL_ERR_ALREADY;
+        }
         /*
          * A server is already running here (someone else's, or a durable one
          * started earlier).  Touch NOTHING: not its owner.json, and — since
@@ -1402,6 +1430,13 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
     if (!durable) track_instance(inst);
     *out = inst;
     return RPGL_OK;
+}
+
+int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
+    int dir_lock = -1;
+    int rc = start_impl(opts, out, &dir_lock);
+    if (dir_lock >= 0) close(dir_lock);   /* releases the flock */
+    return rc;
 }
 
 static void free_instance(rpgl_instance *inst) {

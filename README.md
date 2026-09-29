@@ -65,8 +65,8 @@ sweep, 0.1.x's ten-minute cleanup nor `/tmp/rpgl_*` reapers look at it — but
 **`data_dir` is for throwaway clusters only.** Starting on a directory
 appends `fsync = off`, `full_page_writes = off`, `listen_addresses = ''`
 (and more) to its `postgresql.conf`. Never point it at a cluster you care
-about. Starting on a directory where a server is already running fails and
-changes nothing.
+about. Starting on a directory where a server is already running (or another start
+is under way) fails and changes nothing.
 
 Stopping by data dir, from a script (e.g. a dev stack's `down`):
 
