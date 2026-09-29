@@ -176,6 +176,9 @@ watchdog blocks reading it.
   version never judges a dir by age, but 0.1.x did (older than ten minutes
   with no answering socket meant "stale"), and a machine runs mixed versions
   for a while: an idle live server's dir must never look old to them.
+  The heartbeat is a subshell with the watchdog's own command line; if the
+  watchdog is SIGKILLed it notices at its next beat and exits, so it can
+  outlive it by up to 60 s (touching a dir that is about to be swept).
 - The watchdog is in its own session and ignores HUP/INT/QUIT/TERM/PIPE, so a
   Ctrl-C to the test runner's process group, or a closed terminal, does not
   take it down with the owner. It holds none of the owner's other file
@@ -236,10 +239,29 @@ wait. Stopping a server checks, on Linux, that the PID in `postmaster.pid` is
 a process whose cwd is that data dir, so a stale pidfile whose PID has been
 reused never gets a signal sent to the wrong process.
 
+**Owner checks.** A PID and its start time decide whether an owner is alive.
+The boot id never does on its own: a PID whose start time still matches is
+alive, whatever the boot id says. (On macOS the boot id is
+`kern.bootsessionuuid`, not `kern.boottime`, which moves when the clock is
+stepped.) On macOS, as on Linux, a postmaster is recognised by its cwd being
+the data dir (`proc_pidinfo(PROC_PIDVNODEPATHINFO)`), so a stale
+`postmaster.pid` whose PID was reused never gets a signal. The shim only ever
+`waitpid()`s a postmaster it forked itself.
+
+**Starting on an occupied dir** returns `RPGL_ERR_ALREADY` before touching
+anything — not its `owner.json`, not its server. Otherwise a failed start's
+clean-up would stop the server that was already there.
+
+**fork() without exec.** A `pthread_atfork` child handler makes the child
+forget the parent's instances (so its `exit()` does not stop them) and close
+its copies of every watchdog socket (so it does not keep the parent's
+servers up after the parent dies).
+
 **Durable servers** (`rpgl_options.durable`) are for servers that must not be
 tied to any process lifetime — a dev database behind a fixed port, say. No
 watchdog, no `atexit` stop, never swept; `rpgl_stop()` or `rpgl_stop_dir()`
-(`rustypglite stop <dir>`) end them.
+(`rustypglite stop <dir>`) end them. An auto dir for a durable server is
+`<temp root>/rpgldur_XXXXXX`, outside everything that scans `rpgl_*`.
 
 **The temp root** is `rpgl_options.temp_root`, else `$RUSTYPGLITE_TMPDIR`,
 else `/tmp`. Tests use their own root so that their sweeps can only ever see
@@ -251,9 +273,17 @@ finalizer, a DI container's disposal — runs at the end of a run. Every server
 still open then is the watchdog's to stop. That is the normal path, not the
 exceptional one.
 
-**What is not covered:** a server whose owner *and* watchdog were both
-SIGKILLed stays up until the next start (or `rustypglite sweep`) on that
-machine. A server started by 0.1.x stays up until someone stops it.
+**What is not covered:**
+- A server whose owner *and* watchdog were both SIGKILLed stays up until the
+  next start (or `rustypglite sweep`) on that machine.
+- A server started by 0.1.x stays up until someone stops it.
+- An owner SIGKILLed in the instant between `mkdtemp` and forking the
+  watchdog leaves an empty `rpgl_*` dir with no `owner.json` — "legacy" to
+  the sweep, which never deletes those. So does an initdb orphaned by a dead
+  owner that outlasts the watchdog's retries. Both hold no process.
+- Two processes starting on the same supplied `data_dir` at the same instant
+  can both pass the "already running" check; the loser's clean-up may then
+  stop the winner.
 
 3. **`rpgl_exec_sql()` / `rpgl_create_database()`**
    - Shells out to `psql` / `createdb` for setup operations

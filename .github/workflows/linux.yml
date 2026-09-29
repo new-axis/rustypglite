@@ -1,0 +1,109 @@
+# Linux: build the linux-x64 shim that the NuGet package ships, and run every
+# suite against it — Rust, .NET and Node, each including the "no leaked
+# servers" lifecycle tests (kill -9 of an owner, the sweep, durable servers).
+#
+# THE RUNNER IMAGE IS PINNED, NOT ubuntu-latest. The .so is committed and
+# loaded on consumers' machines, and glibc symbol versions only go one way: a
+# shim built against a newer glibc will not load on an older one. Built on a
+# developer's Debian 13 it needed GLIBC_2.38 (the C23 fscanf/strtol aliases);
+# built here it needs what 22.04 has (2.35) or less. Moving this image forward
+# raises the floor for every consumer — do it on purpose.
+#
+# The artifact is attested (build provenance), and the committed copy is this
+# artifact byte for byte: runtimes/SHA256SUMS records the hash and the run.
+
+name: Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write      # build-provenance attestation
+  attestations: write
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          uname -sm
+          ldd --version | head -1
+          rustc --version
+          cargo --version
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build the shim
+        run: cargo build --release
+
+      - name: Report the glibc the shim needs
+        run: |
+          objdump -T target/release/librustypglite.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          sha256sum target/release/librustypglite.so
+
+      - name: Provision Postgres binaries
+        run: scripts/bootstrap-pg.sh rustypglite-sys/pg-install
+
+      # Every suite gets its own temp root: the sweep in each start must only
+      # ever see this run's servers, never the runner's /tmp.
+      - name: Rust tests
+        env:
+          RUSTYPGLITE_PG_DIR: ${{ github.workspace }}/rustypglite-sys/pg-install
+          RUSTYPGLITE_TMPDIR: ${{ runner.temp }}/rt
+          RUSTYPGLITE_TEST_ROOT: ${{ runner.temp }}/rr
+        run: |
+          mkdir -p "$RUSTYPGLITE_TMPDIR" "$RUSTYPGLITE_TEST_ROOT"
+          cargo test --release
+
+      - name: .NET tests, against the shim built above
+        env:
+          RUSTYPGLITE_PG_DIR: ${{ github.workspace }}/rustypglite-sys/pg-install
+          RUSTYPGLITE_TMPDIR: ${{ runner.temp }}/ct
+          RUSTYPGLITE_TEST_ROOT: ${{ runner.temp }}/cr
+        run: |
+          mkdir -p "$RUSTYPGLITE_TMPDIR" "$RUSTYPGLITE_TEST_ROOT"
+          cp target/release/librustypglite.so rustypglite-csharp/RustyPGlite/runtimes/linux-x64/native/librustypglite.so
+          dotnet test rustypglite-csharp/RustyPGlite.Tests/RustyPGlite.Tests.csproj -c Release
+
+      # --ignore-scripts: the postinstall would download Postgres again;
+      # RUSTYPGLITE_PG_DIR points at the one provisioned above.
+      - name: Node tests
+        working-directory: rustypglite-node
+        env:
+          RUSTYPGLITE_PG_DIR: ${{ github.workspace }}/rustypglite-sys/pg-install
+          RUSTYPGLITE_TMPDIR: ${{ runner.temp }}/nt
+          RUSTYPGLITE_TEST_ROOT: ${{ runner.temp }}/nr
+        run: |
+          mkdir -p "$RUSTYPGLITE_TMPDIR" "$RUSTYPGLITE_TEST_ROOT"
+          npm install --ignore-scripts --no-audit --no-fund
+          npm run build
+          npm test
+
+      - name: No server left running
+        run: |
+          if pgrep -a -f 'bin/postgres -D' ; then echo "servers left running"; exit 1; fi
+
+      - uses: actions/attest-build-provenance@v2
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        with:
+          subject-path: target/release/librustypglite.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: librustypglite-linux-x64
+          path: target/release/librustypglite.so
+          if-no-files-found: error
