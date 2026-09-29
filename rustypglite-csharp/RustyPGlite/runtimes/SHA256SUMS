@@ -1,0 +1,10 @@
+# The committed native libraries, as built by CI. Each is that run's
+# uploaded artifact, byte for byte. Check with (from this directory):
+#   sha256sum -c SHA256SUMS
+# The linux-x64 one also carries a build-provenance attestation:
+#   gh attestation verify linux-x64/native/librustypglite.so --repo new-axis/rustypglite
+#
+# linux-x64: .github/workflows/linux.yml, ubuntu-22.04, run 36507557273 (commit ec82070); needs glibc >= 2.34
+# osx-arm64: .github/workflows/macos.yml, macos-14, run 36507557306 (commit ec82070)
+a7cf7a0c72629a844fd1201a4150490236a1effa9a779b4cbb0f0e6bcea06632  linux-x64/native/librustypglite.so
+ca0b71a304ff9eda018309959fa0aa071572d13786cc506ea519e1b35aa40b05  osx-arm64/native/librustypglite.dylib

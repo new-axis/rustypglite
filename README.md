@@ -37,11 +37,83 @@ See [NODEJS-INTEGRATION.md](NODEJS-INTEGRATION.md).
 
 Design and benchmarks: [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## No leaked servers
+
+A server never outlives the process that started it (its *owner*), however
+that process ends:
+
+- **Dispose / drop / `stop()`** stops it and removes its data dir, as before.
+- **A normal exit** stops every server the process still holds.
+- **SIGKILL, a crash, a cancelled test run** — a small watchdog process, one
+  per server, notices its owner is gone, fast-stops the server and removes the
+  data dir, within a second or two.
+- **Every start sweeps** the temp root and reclaims a server only when the
+  `owner.json` in its data dir proves both its owner (PID *and* start time, so
+  a reused PID cannot pass) and its watchdog are dead. It never touches a live
+  owner's server however old it is, a durable one, or a dir without
+  `owner.json` — and there is no age- or mtime-based cleanup any more.
+
+A long-lived server that must outlive its starter (a dev database, say) asks
+for that explicitly: start it **durable** (`durable` / `Durable` option). It
+gets no watchdog, is not stopped on exit or dispose, is marked
+`"durable": true` in its `owner.json`, and is never swept. Stop it explicitly.
+Give a durable server a `data_dir` of its own, outside `/tmp`. (Without one it
+gets `<temp root>/rpgldur_XXXXXX` — deliberately not `rpgl_*`, so neither the
+sweep, 0.1.x's ten-minute cleanup nor `/tmp/rpgl_*` reapers look at it — but
+`/tmp` is still `/tmp`.)
+
+**`data_dir` is for throwaway clusters only.** Starting on a directory
+appends `fsync = off`, `full_page_writes = off`, `listen_addresses = ''`
+(and more) to its `postgresql.conf`. Never point it at a cluster you care
+about. Starting on a directory where a server is already running (or another start
+is under way) fails and changes nothing.
+
+Stopping by data dir, from a script (e.g. a dev stack's `down`):
+
+```bash
+rustypglite stop /tmp/rpgl_AbC123      # Rust CLI: cargo install --path rustypglite
+npx rustypglite stop /tmp/rpgl_AbC123  # the same, from the Node package
+rustypglite sweep                      # reclaim dead owners' servers now, and report
+```
+
+or `EmbeddedPg.StopDir(dir)` (.NET), `stopDir(dir)` (Node),
+`rustypglite::stop_dir(dir)` (Rust). The dir is removed only if rustypglite
+created it; a data dir you supplied is kept.
+
+`RUSTYPGLITE_TMPDIR` (or the `temp_root` / `TempRoot` / `tempRoot` option)
+moves the auto data dirs — and the sweep — out of `/tmp`.
+
+**Forking.** A child made by `fork()` *without* `exec` is not an owner: its
+exit does not stop the parent's servers, and it lets go of the watchdog
+sockets it inherited, so the parent's servers still end with the parent. It
+can use a handle it inherited, and stop it explicitly.
+
+**`keep_data`** keeps a stopped server's dir. Under `/tmp/rpgl_*` nothing
+touches it any more, so 0.1.x processes on the same machine will delete it
+after ten minutes; keep data you want in a `data_dir` outside `/tmp`.
+
+**If you wrote your own watchdog** around 0.1.x (a process holding a pipe
+from the owner, stopping the server on EOF, touching the dir so 0.1.x's
+cleanup would not take it): delete it when you move to 0.2. The library now
+does all three, from before initdb, for every binding. Running both at once
+is harmless — whichever acts second finds nothing left to do.
+
+**Getting 0.2 through Nucleus.PgLite:** Nucleus.PgLite declares
+`RustyPGlite >= 0.1.0`, and NuGet resolves the *lowest* version that
+satisfies a range. So a consumer gets 0.2.0 only through a Nucleus.PgLite
+release that raises that floor, or by adding its own
+`<PackageReference Include="RustyPGlite" Version="0.2.0" />`.
+
+**Upgrading from 0.1.x:** servers started by 0.1.x have no `owner.json`, so
+0.2 leaves them alone (nothing can tell whether their owner is alive) and says
+once per process how many old ones it saw. Stop those with
+`rustypglite stop <dir>`. 0.1.x's own ten-minute "stale dir" cleanup is gone.
+
 ## Platforms
 
 | Platform | Status |
 |---|---|
-| linux-x64 | Supported. The prebuilt shim is committed, so consumers build with no Rust toolchain. |
+| linux-x64 | Supported. The prebuilt shim is committed, so consumers build with no Rust toolchain. It is built by the Linux workflow on Ubuntu 22.04 and needs glibc 2.34 or newer (see `runtimes/SHA256SUMS`). |
 | osx-arm64 / osx-x64 | Builds; **not yet verified on real hardware** — see below. |
 | linux-arm64 | Should build; unverified. |
 | Windows | Not supported. The shim is POSIX (`fork`/`execv`/`dlopen`). |

@@ -1,9 +1,12 @@
 {
   "name": "rustypglite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Embedded PostgreSQL server for Node.js — real Postgres, zero infrastructure",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "rustypglite": "dist/cli.js"
+  },
   "type": "module",
   "scripts": {
     "postinstall": "bash scripts/download-pg.sh",

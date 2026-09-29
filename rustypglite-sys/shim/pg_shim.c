@@ -3,6 +3,10 @@
  *
  * Manages a real postgres server process: initdb → pg_ctl start → unix socket.
  * Any standard Postgres client connects via the returned connection string.
+ *
+ * A server started here never outlives the process that started it (its
+ * "owner"), however that process ends — see "Ownership" below — unless the
+ * caller asked for a durable server.
  */
 
 #define _GNU_SOURCE  /* for dladdr */
@@ -20,12 +24,20 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <dirent.h>
+#include <limits.h>
+#include <ftw.h>
 #include <sys/file.h>
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <libproc.h>
+#endif
 
 /* ---- Instance ---- */
 
@@ -38,203 +50,118 @@ struct rpgl_instance {
     char     error_msg[2048];
     int      port;
     int      owns_data_dir;  /* should we delete it on stop? */
+    int      borrowed;       /* from rpgl_connect_existing: never stop it */
+    int      durable;        /* not bound to our lifetime, never swept */
     pid_t    pg_pid;         /* postmaster PID (0 if not running) */
+    pid_t    pg_child;       /* the postmaster, when it is our own child (no pg_ctl) */
+    pid_t    watcher_pid;    /* the watchdog process (0 if none) */
+    int      watcher_fd;     /* our end of the watchdog socket (-1 if none) */
+    char     token[40];      /* identifies this start in owner.json */
 };
 
 /* ---- Instance tracking for cleanup on exit ---- */
+/*
+ * A normal exit stops every server we still hold, synchronously, so the
+ * process does not end with work left for the watchdog.  There are
+ * deliberately NO signal handlers: stopping a server from inside one calls
+ * fork/malloc/exec, which is not async-signal-safe and can deadlock the very
+ * process we are trying to clean up after — a hung owner holds its watchdog
+ * socket open and so leaks the server.  A process killed by a signal is the
+ * watchdog's job.
+ */
 
 #define MAX_INSTANCES 256
 static rpgl_instance *g_instances[MAX_INSTANCES];
 static int g_instance_count = 0;
 static int g_atexit_registered = 0;
+static pthread_mutex_t g_instances_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void cleanup_all_instances(void) {
+    for (;;) {
+        pthread_mutex_lock(&g_instances_lock);
+        rpgl_instance *inst = g_instance_count > 0 ? g_instances[g_instance_count - 1] : NULL;
+        pthread_mutex_unlock(&g_instances_lock);
+        if (!inst) return;
+        rpgl_stop(inst);   /* untracks itself */
+    }
+}
+
+/*
+ * Every watchdog socket end this process holds, including those of detached
+ * instances, so that a forked child can let go of them all.
+ */
+#define MAX_WATCHER_FDS 1024
+static int g_watcher_fds[MAX_WATCHER_FDS];
+static int g_watcher_fd_count = 0;
+
+static void register_watcher_fd(int fd) {
+    pthread_mutex_lock(&g_instances_lock);
+    if (g_watcher_fd_count < MAX_WATCHER_FDS) g_watcher_fds[g_watcher_fd_count++] = fd;
+    pthread_mutex_unlock(&g_instances_lock);
+}
+
+static void unregister_watcher_fd(int fd) {
+    pthread_mutex_lock(&g_instances_lock);
+    for (int i = 0; i < g_watcher_fd_count; i++) {
+        if (g_watcher_fds[i] == fd) { g_watcher_fds[i] = g_watcher_fds[--g_watcher_fd_count]; break; }
+    }
+    pthread_mutex_unlock(&g_instances_lock);
+}
+
+/*
+ * fork() without exec copies our servers' handles into the child, but the
+ * child is not their owner:
+ *  - its exit() would run cleanup_all_instances and stop the PARENT's
+ *    servers, remove their dirs and release their watchdogs;
+ *  - its copy of each watchdog socket would keep the servers up until the
+ *    child, too, has exited.
+ * So the child forgets the instances and closes its copies.  It can still
+ * use a handle it inherited, and stop it explicitly with rpgl_stop().
+ */
+static void atfork_prepare(void) { pthread_mutex_lock(&g_instances_lock); }
+static void atfork_parent(void)  { pthread_mutex_unlock(&g_instances_lock); }
+static void atfork_child(void) {
     for (int i = 0; i < g_instance_count; i++) {
         if (g_instances[i]) {
-            rpgl_stop(g_instances[i]);
-            g_instances[i] = NULL;
+            g_instances[i]->watcher_fd = -1;
+            g_instances[i]->watcher_pid = 0;
         }
+        g_instances[i] = NULL;
     }
     g_instance_count = 0;
+    for (int i = 0; i < g_watcher_fd_count; i++) close(g_watcher_fds[i]);
+    g_watcher_fd_count = 0;
+    pthread_mutex_init(&g_instances_lock, NULL);
 }
 
-static void signal_handler(int sig) {
-    cleanup_all_instances();
-    /* Re-raise to get default behavior (exit with signal status) */
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-/* Forward declaration — used by the stale-dir cleanup below. */
-static int run_cmd(int silent, const char *argv[]);
-
-/* ---- Startup serialization lock (cross-process) ---- */
-/*
- * On fast machines, concurrent rpgl_start() calls race: cleanup_stale_tmpdirs()
- * can delete a freshly-created mkdtemp() directory that has no postmaster.pid
- * yet, causing initdb to fail.  A POSIX advisory lock on a well-known file
- * serialises the cleanup + mkdtemp window across processes.  The lock is held
- * only around cleanup and directory creation, then released before the slow
- * postgres boot — the age guard below (not the lock) is what protects our
- * young data dir from another process's cleanup once we let go.
- */
-#define STARTUP_LOCK_PATH "/tmp/rpgl_startup.lock"
-
-static int acquire_startup_lock(void) {
-    int fd = open(STARTUP_LOCK_PATH, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) return -1;
-    /* Block until we hold an exclusive lock */
-    if (flock(fd, LOCK_EX) < 0) { close(fd); return -1; }
-    return fd;
-}
-
-static void release_startup_lock(int fd) {
-    if (fd >= 0) {
-        flock(fd, LOCK_UN);
-        close(fd);
-    }
-}
-
-/* ---- Stale-dir detection ---- */
-
-/*
- * A crashed-run dir is only reclaimed once it is BOTH older than this AND has
- * no reachable postgres socket.  The age guard closes the initdb window: a dir
- * that was just mkdtemp()'d has no postmaster.pid yet, but it is seconds old,
- * so it is never mistaken for stale — even by a cleanup running outside our
- * startup-lock scope (a concurrent process, or a different PID namespace).
- */
-#define STALE_AGE_SECONDS 600  /* 10 minutes */
-
-/* Try to connect() to a unix socket path.  Returns 1 if a listener accepted. */
-static int socket_accepts(const char *sockpath) {
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) return 0;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sockpath, sizeof(addr.sun_path) - 1);
-    int rc = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    close(sock);
-    return rc == 0;
-}
-
-/* Read the port from line 4 of a data dir's postmaster.pid, or -1. */
-static int port_from_pidfile(const char *dir) {
-    char pidfile[4096];
-    snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", dir);
-    FILE *f = fopen(pidfile, "r");
-    if (!f) return -1;
-    char line[256];
-    int lineno = 0, port = -1;
-    while (fgets(line, sizeof(line), f)) {
-        if (++lineno == 4) { port = atoi(line); break; }
-    }
-    fclose(f);
-    return port;
-}
-
-/*
- * Is a postgres server accepting connections on this data dir's socket?
- *
- * We probe the unix socket rather than `kill -0` the pid: a socket connect()
- * works across PID namespaces and without signal permission, whereas kill -0
- * reports ESRCH/EPERM for a live process in another namespace — which is
- * exactly how a sandboxed sibling used to see every healthy instance as stale
- * and delete its live data dir.  A dir with no postmaster.pid is treated as
- * not-live (it may be mid-initdb; the age guard, not this, protects it).
- */
-static int dir_has_live_socket(const char *dir) {
-    char pidfile[4096];
-    snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", dir);
-    if (access(pidfile, F_OK) != 0) return 0;
-
-    char sockpath[4096];
-
-    /* Primary: the port named in postmaster.pid (socket == data dir here). */
-    int port = port_from_pidfile(dir);
-    if (port > 0) {
-        snprintf(sockpath, sizeof(sockpath), "%s/.s.PGSQL.%d", dir, port);
-        if (access(sockpath, F_OK) == 0 && socket_accepts(sockpath))
-            return 1;
-    }
-
-    /* Fallback: probe any .s.PGSQL.* socket present in the dir. */
-    DIR *d = opendir(dir);
-    if (d) {
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            if (strncmp(de->d_name, ".s.PGSQL.", 9) != 0) continue;
-            snprintf(sockpath, sizeof(sockpath), "%s/%s", dir, de->d_name);
-            if (socket_accepts(sockpath)) { closedir(d); return 1; }
-        }
-        closedir(d);
-    }
-    return 0;
-}
-
-/*
- * Clean up stale /tmp/rpgl_* directories from previous crashed runs.
- *
- * A directory is reclaimed only when it is BOTH:
- *   1. older than STALE_AGE_SECONDS (mtime guard — never touch a young dir,
- *      pidfile or not; closes the concurrent-initdb window), AND
- *   2. has no reachable postgres socket (liveness via connect(), which is
- *      namespace/permission agnostic — see dir_has_live_socket).
- *
- * Deletion forks /bin/rm directly (no shell) so a hostile directory name in
- * /tmp cannot inject a command.
- */
-static void cleanup_stale_tmpdirs(void) {
-    DIR *tmp = opendir("/tmp");
-    if (!tmp) return;
-
-    time_t now = time(NULL);
-    struct dirent *de;
-    while ((de = readdir(tmp)) != NULL) {
-        if (strncmp(de->d_name, "rpgl_", 5) != 0) continue;
-
-        char path[4096];
-        snprintf(path, sizeof(path), "/tmp/%s", de->d_name);
-
-        struct stat st;
-        if (lstat(path, &st) != 0) continue;
-        if (!S_ISDIR(st.st_mode)) continue;   /* skips rpgl_startup.lock */
-
-        /* Age guard: never delete a dir younger than the threshold. */
-        if (now - st.st_mtime < STALE_AGE_SECONDS) continue;
-
-        /* Liveness guard: keep any dir with a reachable server. */
-        if (dir_has_live_socket(path)) continue;
-
-        /* Old AND no reachable server → genuinely stale. */
-        const char *rm_argv[] = { "/bin/rm", "-rf", path, NULL };
-        run_cmd(1, rm_argv);
-    }
-    closedir(tmp);
+static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
+static void register_atfork(void) {
+    pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
 }
 
 static void track_instance(rpgl_instance *inst) {
+    pthread_once(&g_atfork_once, register_atfork);
+    pthread_mutex_lock(&g_instances_lock);
     if (!g_atexit_registered) {
         atexit(cleanup_all_instances);
-        signal(SIGTERM, signal_handler);
-        signal(SIGINT, signal_handler);
-        signal(SIGHUP, signal_handler);
         g_atexit_registered = 1;
     }
     if (g_instance_count < MAX_INSTANCES) {
         g_instances[g_instance_count++] = inst;
     }
+    pthread_mutex_unlock(&g_instances_lock);
 }
 
 static void untrack_instance(rpgl_instance *inst) {
+    pthread_mutex_lock(&g_instances_lock);
     for (int i = 0; i < g_instance_count; i++) {
         if (g_instances[i] == inst) {
             g_instances[i] = g_instances[--g_instance_count];
             g_instances[g_instance_count] = NULL;
-            return;
+            break;
         }
     }
+    pthread_mutex_unlock(&g_instances_lock);
 }
 
 /* ---- Helpers ---- */
@@ -462,31 +389,818 @@ static int wait_for_ready(rpgl_instance *inst, int timeout_ms) {
     return RPGL_ERR_TIMEOUT;
 }
 
-/* ---- Public API ---- */
+/* ---- Ownership ---- */
+/*
+ * Every server started here is bound to its owner — the process that called
+ * rpgl_start() — in two ways:
+ *
+ *  1. A WATCHDOG.  Before initdb we fork a small /bin/sh process holding one
+ *     end of a socketpair; the owner holds the other end, close-on-exec, so no
+ *     other process (postgres included) inherits it.  When the owner stops the
+ *     server it writes "released" and the watchdog exits.  When the owner dies
+ *     any other way — SIGKILL, a crash, an abort — the kernel closes its end,
+ *     the watchdog reads EOF, fast-stops the server and removes the data dir.
+ *     The watchdog is in its own session, ignores the terminal's signals and
+ *     does not share the owner's fate, which is the point: a thread in the
+ *     owner, or a signal handler, dies with it before it can act.
+ *
+ *     Why not PR_SET_PDEATHSIG?  pg_ctl daemonises the postmaster (it forks,
+ *     setsid()s, execs /bin/sh which execs postgres, and exits), so the
+ *     postmaster's parent is init, not the owner, and PDEATHSIG would never
+ *     fire.  Even if we stopped using pg_ctl: PDEATHSIG fires when the forking
+ *     THREAD exits, not the process — in .NET or Node that is a thread-pool
+ *     thread, which would kill a healthy server mid-suite; it is Linux-only;
+ *     and it kills the server but cannot remove the data dir.
+ *
+ *  2. owner.json in the data dir, naming the owner by PID *and* start time
+ *     (so a reused PID cannot pass for it), the boot, and the PID namespace.
+ *     Every rpgl_start() first sweeps the temp root and reclaims a server
+ *     only when owner.json proves its owner is dead and its watchdog is gone
+ *     too.  This is the backstop for a watchdog that was itself killed.
+ *
+ * A durable server (opts->durable) gets neither a watchdog nor atexit
+ * handling, and the sweep never touches it; only rpgl_stop / rpgl_stop_dir
+ * stop it.
+ */
 
-int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
-    if (!out) return RPGL_ERR_INIT;
+#define OWNER_FILE "owner.json"
+#define OWNER_JSON_MAX 65536
+
+/* What we know about a process's identity, as opaque strings. */
+static void read_small_file(const char *path, char *out, size_t outsz) {
+    out[0] = '\0';
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    size_t n = fread(out, 1, outsz - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    out[strcspn(out, "\n")] = '\0';
+}
+
+/* Identifies this boot: a PID + start time is only meaningful within one. */
+static void current_boot_id(char *out, size_t outsz) {
+#if defined(__linux__)
+    read_small_file("/proc/sys/kernel/random/boot_id", out, outsz);
+#elif defined(__APPLE__)
+    /*
+     * NOT kern.boottime: that is derived from the wall clock and moves when
+     * the clock is stepped (NTP, wake from sleep).  The boot session UUID is
+     * fixed for the life of the boot.
+     */
+    size_t len = outsz;
+    if (sysctlbyname("kern.bootsessionuuid", out, &len, NULL, 0) != 0) out[0] = '\0';
+    else out[outsz - 1] = '\0';
+#else
+    out[0] = '\0';
+#endif
+}
+
+/* PIDs are only comparable within one PID namespace. */
+static void current_pid_ns(char *out, size_t outsz) {
+    out[0] = '\0';
+#if defined(__linux__)
+    ssize_t n = readlink("/proc/self/ns/pid", out, outsz - 1);
+    out[n > 0 ? n : 0] = '\0';
+#endif
+}
+
+/*
+ * The start time of a process as an opaque string.
+ * Returns 0 on success, -1 if there is no such process, -2 if it exists (or
+ * may) but its start time cannot be read.
+ */
+static int proc_start_time(pid_t pid, char *out, size_t outsz) {
+    if (pid <= 0) return -2;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return -1;
+#if defined(__linux__)
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return errno == ENOENT ? -1 : -2;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    /* comm (field 2) may contain spaces and parens: parse after the last ')'. */
+    char *p = strrchr(buf, ')');
+    if (!p || p[1] != ' ') return -2;
+    p += 2;                                  /* field 3 */
+    for (int field = 3; field < 22; field++) {
+        p = strchr(p, ' ');
+        if (!p) return -2;
+        p++;
+    }
+    size_t len = strcspn(p, " ");            /* field 22: starttime */
+    if (len == 0 || len >= outsz) return -2;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 0;
+#elif defined(__APPLE__)
+    struct kinfo_proc kp;
+    size_t len = sizeof(kp);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+    memset(&kp, 0, sizeof(kp));
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0) return -2;
+    if (len == 0) return -1;
+    snprintf(out, outsz, "%ld.%06ld",
+             (long)kp.kp_proc.p_starttime.tv_sec,
+             (long)kp.kp_proc.p_starttime.tv_usec);
+    return 0;
+#else
+    (void)out; (void)outsz;
+    return -2;
+#endif
+}
+
+static void random_token(char *out, size_t outsz) {
+    unsigned char bytes[16];
+    int ok = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ok = read(fd, bytes, sizeof(bytes)) == (ssize_t)sizeof(bytes);
+        close(fd);
+    }
+    if (!ok) {
+        static unsigned long counter = 0;
+        unsigned long long seed = ((unsigned long long)getpid() << 32)
+                                ^ (unsigned long long)time(NULL)
+                                ^ (unsigned long long)(++counter * 2654435761u);
+        for (size_t i = 0; i < sizeof(bytes); i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            bytes[i] = (unsigned char)(seed >> 56);
+        }
+    }
+    for (size_t i = 0; i < sizeof(bytes) && 2 * i + 2 < outsz; i++)
+        snprintf(out + 2 * i, 3, "%02x", bytes[i]);
+}
+
+/* ---- owner.json ---- */
+
+static void json_put_string(FILE *f, const char *s) {
+    if (!s) { fputs("null", f); return; }
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') fprintf(f, "\\%c", *p);
+        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else fputc(*p, f);
+    }
+    fputc('"', f);
+}
+
+/* Where the value of "key" starts in a flat JSON object we wrote, or NULL. */
+static const char *json_value(const char *json, const char *key) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = json;
+    while ((p = strstr(p, needle)) != NULL) {
+        const char *q = p + strlen(needle);
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q == ':') {
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            return q;
+        }
+        p = q;
+    }
+    return NULL;
+}
+
+/* A string value; 0 on success.  Escapes other than \" and \\ are kept raw. */
+static int json_get_string(const char *json, const char *key, char *out, size_t outsz) {
+    const char *v = json_value(json, key);
+    if (!v || *v != '"') return -1;
+    size_t n = 0;
+    for (v++; *v && *v != '"'; v++) {
+        if (*v == '\\' && v[1]) v++;
+        if (n + 1 >= outsz) return -1;
+        out[n++] = *v;
+    }
+    if (*v != '"') return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+static int json_get_long(const char *json, const char *key, long *out) {
+    const char *v = json_value(json, key);
+    if (!v) return -1;
+    char *end;
+    errno = 0;
+    long x = strtol(v, &end, 10);
+    if (end == v || errno) return -1;
+    *out = x;
+    return 0;
+}
+
+/* 1 for true, 0 for false, -1 when absent or not a boolean. */
+static int json_get_bool(const char *json, const char *key) {
+    const char *v = json_value(json, key);
+    if (!v) return -1;
+    if (strncmp(v, "true", 4) == 0) return 1;
+    if (strncmp(v, "false", 5) == 0) return 0;
+    return -1;
+}
+
+/*
+ * Write owner.json atomically (temp file + rename), so a reader never sees
+ * half of one.  Returns 0 on success.
+ */
+static int write_owner_file(rpgl_instance *inst) {
+    char path[4096], tmp[4096];
+    snprintf(path, sizeof(path), "%s/%s", inst->data_dir, OWNER_FILE);
+    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", inst->data_dir, OWNER_FILE);
+
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return -1; }
+
+    char owner_start[64] = "", watcher_start[64] = "", boot[128], ns[128], cwd[4096];
+    proc_start_time(getpid(), owner_start, sizeof(owner_start));
+    if (inst->watcher_pid > 0)
+        proc_start_time(inst->watcher_pid, watcher_start, sizeof(watcher_start));
+    current_boot_id(boot, sizeof(boot));
+    current_pid_ns(ns, sizeof(ns));
+    if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+
+    /* Informational: which session (agent, CI job, shell) started it. */
+    static const char *const session_vars[] = {
+        "RUSTYPGLITE_SESSION_ID",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        NULL
+    };
+    const char *session_var = NULL, *session_id = NULL;
+    for (int i = 0; session_vars[i]; i++) {
+        const char *v = getenv(session_vars[i]);
+        if (v && *v) { session_var = session_vars[i]; session_id = v; break; }
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"version\": 1,\n");
+    fprintf(f, "  \"owner_pid\": %d,\n", (int)getpid());
+    fprintf(f, "  \"owner_start\": "); json_put_string(f, owner_start); fprintf(f, ",\n");
+    fprintf(f, "  \"owner_cwd\": "); json_put_string(f, cwd); fprintf(f, ",\n");
+    fprintf(f, "  \"unix_session\": %d,\n", (int)getsid(0));
+    fprintf(f, "  \"session_id\": "); json_put_string(f, session_id); fprintf(f, ",\n");
+    fprintf(f, "  \"session_var\": "); json_put_string(f, session_var); fprintf(f, ",\n");
+    fprintf(f, "  \"boot_id\": "); json_put_string(f, boot); fprintf(f, ",\n");
+    fprintf(f, "  \"pid_ns\": "); json_put_string(f, ns); fprintf(f, ",\n");
+    fprintf(f, "  \"watcher_pid\": %d,\n", (int)inst->watcher_pid);
+    fprintf(f, "  \"watcher_start\": "); json_put_string(f, watcher_start); fprintf(f, ",\n");
+    fprintf(f, "  \"durable\": %s,\n", inst->durable ? "true" : "false");
+    fprintf(f, "  \"owns_data_dir\": %s,\n", inst->owns_data_dir ? "true" : "false");
+    fprintf(f, "  \"port\": %d,\n", inst->port);
+    fprintf(f, "  \"created_at\": %ld,\n", (long)time(NULL));
+    fprintf(f, "  \"token\": "); json_put_string(f, inst->token); fprintf(f, "\n");
+    fprintf(f, "}\n");
+
+    if (fclose(f) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+/*
+ * Read a dir's owner.json into buf.  Returns 0 on success, -1 if there is
+ * none, -2 if it exists but cannot be trusted (not ours, not a regular file,
+ * unreadable, too large).
+ */
+static int read_owner_file(const char *dir, char *buf, size_t bufsz) {
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", dir, OWNER_FILE);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? -1 : -2;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()
+        || st.st_size <= 0 || (size_t)st.st_size >= bufsz) {
+        close(fd);
+        return -2;
+    }
+    ssize_t n = read(fd, buf, bufsz - 1);
+    close(fd);
+    if (n <= 0) return -2;
+    buf[n] = '\0';
+    return 0;
+}
+
+/* Does this dir's owner.json still carry our token?  (Absent counts as no.) */
+static int owner_token_is(const char *dir, const char *token) {
+    char *buf = malloc(OWNER_JSON_MAX);
+    char have[64];
+    int same = buf && read_owner_file(dir, buf, OWNER_JSON_MAX) == 0
+            && json_get_string(buf, "token", have, sizeof(have)) == 0
+            && strcmp(have, token) == 0;
+    free(buf);
+    return same;
+}
+
+enum { PROC_DEAD = 0, PROC_ALIVE = 1, PROC_UNKNOWN = 2 };
+
+/*
+ * Is the process named by (pid, start) — recorded in owner.json under the
+ * given boot and PID namespace — still running?  UNKNOWN whenever we cannot
+ * be sure, and callers must treat UNKNOWN as alive.
+ */
+static int process_state(long pid, const char *start, const char *boot, const char *ns) {
+    char cur_boot[128], cur_ns[128], cur_start[64];
+    current_boot_id(cur_boot, sizeof(cur_boot));
+    current_pid_ns(cur_ns, sizeof(cur_ns));
 
     /*
-     * Serialise the cleanup + directory-creation window across processes, then
-     * release before the slow boot.  Cleaning up and mkdtemp()'ing under the
-     * lock keeps a concurrent rpgl_start() from scanning /tmp while our new
-     * dir exists but is not yet populated; once we hold a data dir, the age
-     * guard in cleanup_stale_tmpdirs() protects it and we no longer need the
-     * lock (so parallel boots proceed independently).
+     * A different PID namespace (a container, a sandbox): the PID means
+     * something else here, and "no such process" proves nothing.  Hands off.
      */
-    int lock_fd = acquire_startup_lock();
+    if (strcmp(ns, cur_ns) != 0) return PROC_UNKNOWN;
+    if (pid <= 0 || !start[0]) return PROC_UNKNOWN;
 
-    /* Clean up any stale tmpdirs from previous crashed runs */
-    cleanup_stale_tmpdirs();
+    int rc = proc_start_time((pid_t)pid, cur_start, sizeof(cur_start));
+    if (rc == -1) return PROC_DEAD;
+    if (rc != 0) return PROC_UNKNOWN;
+    /*
+     * PID and start time match: alive.  The boot id alone never decides —
+     * on macOS it was once derived from kern.boottime, which moves when the
+     * clock is stepped, and start times there are absolute anyway.
+     */
+    if (strcmp(start, cur_start) == 0) {
+#if defined(__linux__)
+        /*
+         * Except on Linux across a reboot: start times there are ticks since
+         * boot, so under a different boot_id (a random UUID per boot, which
+         * never moves) an equal one is a coincidence — early-boot PIDs and
+         * their start ticks repeat.  The owner is gone.
+         */
+        if (boot[0] && cur_boot[0] && strcmp(boot, cur_boot) != 0) return PROC_DEAD;
+#endif
+        return PROC_ALIVE;
+    }
+    /* Same PID, different start time: the PID was reused.  The owner is gone. */
+    (void)boot; (void)cur_boot;
+    return PROC_DEAD;
+}
+
+/* ---- Stopping a server by its data dir ---- */
+
+/* The postmaster PID from line 1 of postmaster.pid, or 0. */
+static pid_t postmaster_pid(const char *dir) {
+    char pidfile[4096];
+    snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", dir);
+    FILE *f = fopen(pidfile, "r");
+    if (!f) return 0;
+    long pid = 0;
+    if (fscanf(f, "%ld", &pid) != 1) pid = 0;
+    fclose(f);
+    return pid > 0 ? (pid_t)pid : 0;
+}
+
+/*
+ * Is pid a running postmaster for this data dir?  1 yes (or cannot rule it
+ * out), 0 no.  A postmaster chdir()s into its data dir, so on Linux its cwd
+ * tells a live server apart from a stale postmaster.pid whose PID has since
+ * been reused by an unrelated process.
+ */
+static int is_postmaster_of(pid_t pid, const char *dir) {
+    if (pid <= 0) return 0;
+    /*
+     * ESRCH: no such process.  EPERM: another user's — and a postmaster we
+     * (or anyone we could stop) started runs as us.  Either way not ours:
+     * this is how Postgres itself reads a stale postmaster.pid, which after a
+     * reboot or crash can name a PID now owned by root.
+     */
+    if (kill(pid, 0) != 0) return 0;
+    char real[PATH_MAX];
+#if defined(__linux__)
+    char link[64], cwd[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/%d/cwd", (int)pid);
+    ssize_t n = readlink(link, cwd, sizeof(cwd) - 1);
+    if (n < 0) return errno == ENOENT ? 0 : 1;   /* gone (or a zombie) vs. can't see */
+    cwd[n] = '\0';
+    if (!realpath(dir, real)) return 1;
+    return strcmp(cwd, real) == 0;
+#elif defined(__APPLE__)
+    struct proc_vnodepathinfo vpi;
+    int n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof(vpi));
+    if (n != (int)sizeof(vpi)) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) return 0;
+        return 1;                                /* exists, but we cannot see it */
+    }
+    if (vpi.pvi_cdir.vip_path[0] == '\0') return 0;   /* a zombie has no cwd */
+    if (!realpath(dir, real)) return 1;
+    return strcmp(vpi.pvi_cdir.vip_path, real) == 0;
+#else
+    (void)dir; (void)real;
+    return 1;
+#endif
+}
+
+/*
+ * child: the postmaster's PID when it is OUR child (started without pg_ctl),
+ * so it can be reaped; 0 otherwise.  Never waitpid() a PID read from a file:
+ * after PID reuse it could be one of the host's own children.
+ */
+static int wait_gone(pid_t pid, pid_t child, const char *dir, int timeout_ms) {
+    for (int waited = 0; waited <= timeout_ms; waited += 50) {
+        if (child > 0 && child == pid) waitpid(child, NULL, WNOHANG);
+        if (!is_postmaster_of(pid, dir)) return 1;
+        usleep(50000);
+    }
+    return 0;
+}
+
+/*
+ * Stop whatever server is running in dir: fast shutdown (SIGINT), then
+ * immediate (SIGQUIT), then SIGKILL.  Signals rather than pg_ctl, so it needs
+ * no binaries and trusts nothing but postmaster.pid and the process table.
+ * Returns 0 when no server is running there any more, -1 otherwise.
+ */
+static int stop_server_in_dir(const char *dir, pid_t child) {
+    pid_t pid = postmaster_pid(dir);
+    if (child > 0 && child == pid) waitpid(child, NULL, WNOHANG);
+    if (!is_postmaster_of(pid, dir)) return 0;
+
+    static const int sigs[] = { SIGINT, SIGQUIT, SIGKILL };
+    static const int waits_ms[] = { 10000, 5000, 5000 };
+    for (int i = 0; i < 3; i++) {
+        if (kill(pid, sigs[i]) != 0 && errno == ESRCH) return 0;
+        if (wait_gone(pid, child, dir, waits_ms[i])) return 0;
+    }
+    return -1;
+}
+
+static int remove_entry(const char *path, const struct stat *st, int type, struct FTW *ftw) {
+    (void)st; (void)type; (void)ftw;
+    remove(path);
+    return 0;
+}
+
+/* rm -rf, without a shell.  Returns 0 when the dir is gone. */
+static int remove_tree(const char *dir) {
+    nftw(dir, remove_entry, 32, FTW_DEPTH | FTW_PHYS);
+    struct stat st;
+    return lstat(dir, &st) != 0 && errno == ENOENT ? 0 : -1;
+}
+
+/* ---- The watchdog ---- */
+/*
+ * Runs as: /bin/sh -c WATCHDOG_SCRIPT rustypglite-watchdog DIR TOKEN PG_CTL OWNS BEAT
+ * with its stdin one end of a socketpair whose other end only the owner holds.
+ *
+ * While the owner lives, a background loop touches the dir every BEAT
+ * seconds.  Nothing in this version judges a dir by age, but rustypglite
+ * 0.1.x did (older than ten minutes with no answering socket = stale), and
+ * a machine runs mixed versions for a while: an idle live server's dir must
+ * never look old to them.  The loop ends with the watchdog (it checks $$),
+ * or when the dir is gone.  (The loop inherits the ignored TERM, hence
+ * kill -9; its current `sleep` may outlive it by up to BEAT seconds, holding
+ * nothing.)
+ *
+ * "released" means the owner stopped the server itself: exit untouched.  EOF
+ * without it means the owner is gone: stop the server and, when the dir is
+ * ours to delete, delete it.  It acts only on a dir whose owner.json still
+ * carries this start's token (or has none yet — the owner died during
+ * initdb), so it can never act on a dir that has since been reused.  The loop
+ * covers an initdb or pg_ctl the dead owner left running, which can keep
+ * writing into the dir for a moment after the owner is gone.
+ */
+static const char WATCHDOG_SCRIPT[] =
+    "trap '' HUP INT QUIT TERM PIPE\n"
+    "PATH=/usr/bin:/bin:$PATH\n"
+    "dir=$1 token=$2 pgctl=$3 owns=$4 beat=$5\n"
+    "( while kill -0 $$ 2>/dev/null && [ -d \"$dir\" ]; do\n"
+    "    touch -c \"$dir\"; sleep \"$beat\"\n"
+    "  done ) </dev/null >/dev/null 2>&1 &\n"
+    "hb=$!\n"
+    "IFS= read -r msg\n"
+    "kill -9 $hb 2>/dev/null\n"
+    "[ \"$msg\" = released ] && exit 0\n"
+    "if [ -f \"$dir/owner.json\" ]; then\n"
+    "  grep -qF \"\\\"token\\\": \\\"$token\\\"\" \"$dir/owner.json\" || exit 0\n"
+    "fi\n"
+    "pm() { IFS= read -r p <\"$dir/postmaster.pid\" 2>/dev/null && echo \"$p\"; }\n"
+    "running() {\n"
+    "  if [ -x \"$pgctl\" ]; then \"$pgctl\" status -D \"$dir\" >/dev/null 2>&1; return; fi\n"
+    "  p=$(pm); [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null\n"
+    "}\n"
+    "stop() {\n"
+    "  if [ -x \"$pgctl\" ]; then\n"
+    "    \"$pgctl\" stop -D \"$dir\" -m fast -w -t 10 >/dev/null 2>&1 ||\n"
+    "      \"$pgctl\" stop -D \"$dir\" -m immediate -w -t 5 >/dev/null 2>&1\n"
+    "    return\n"
+    "  fi\n"
+    "  p=$(pm); [ -n \"$p\" ] || return\n"
+    "  for sig in INT QUIT; do\n"
+    "    kill -$sig \"$p\" 2>/dev/null || return\n"
+    "    i=0; while [ $i -lt 10 ] && kill -0 \"$p\" 2>/dev/null; do sleep 1; i=$((i + 1)); done\n"
+    "    kill -0 \"$p\" 2>/dev/null || return\n"
+    "  done\n"
+    "}\n"
+    "n=0\n"
+    "while [ $n -lt 5 ]; do\n"
+    "  n=$((n + 1))\n"
+    "  stop\n"
+    "  [ \"$owns\" = 1 ] || exit 0\n"
+    "  [ -d \"$dir\" ] || exit 0\n"
+    "  if running; then sleep 1; continue; fi\n"
+    "  rm -rf -- \"$dir\"\n"
+    "  sleep 1\n"
+    "done\n";
+
+#if !defined(SOCK_CLOEXEC)
+static void set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+#endif
+
+/*
+ * Fork the watchdog for inst.  Returns 0 on success.  Everything the child
+ * needs is prepared before fork(): the owner may be multithreaded (.NET,
+ * Node), so between fork and exec the child makes only async-signal-safe
+ * calls.
+ */
+static int spawn_watchdog(rpgl_instance *inst) {
+    char pg_ctl[4096];
+    snprintf(pg_ctl, sizeof(pg_ctl), "%s/pg_ctl", inst->pg_bin_dir);
+    /* Heartbeat, seconds.  Overridable for tests only. */
+    char beat[16] = "60";
+    const char *beat_env = getenv("RUSTYPGLITE_HEARTBEAT_SECONDS");
+    if (beat_env && atoi(beat_env) > 0) snprintf(beat, sizeof(beat), "%d", atoi(beat_env));
+    const char *argv[] = {
+        "/bin/sh", "-c", WATCHDOG_SCRIPT, "rustypglite-watchdog",
+        inst->data_dir, inst->token, pg_ctl, inst->owns_data_dir ? "1" : "0", beat,
+        NULL
+    };
+
+    int sv[2];
+#if defined(SOCK_CLOEXEC)
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) return -1;
+#else
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    set_cloexec(sv[0]);
+    set_cloexec(sv[1]);
+#endif
+#if defined(SO_NOSIGPIPE)
+    { int one = 1; setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
+#endif
+
+    pthread_once(&g_atfork_once, register_atfork);
+    int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+    struct rlimit rl;
+    int max_fd = (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
+                  && rl.rlim_cur < 65536) ? (int)rl.rlim_cur : 65536;
+    sigset_t none;
+    sigemptyset(&none);
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(sv[0]); close(sv[1]);
+        if (devnull >= 0) close(devnull);
+        return -1;
+    }
+    if (pid == 0) {
+        setsid();                       /* out of the owner's terminal and group */
+        /*
+         * The host's handlers are still installed until exec: set every
+         * signal to its default BEFORE unmasking, so a pending one cannot run
+         * the host's handler in this half-copied process.
+         */
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (sig == SIGKILL || sig == SIGSTOP) continue;
+            sigaction(sig, &dfl, NULL);
+        }
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        if (dup2(sv[1], STDIN_FILENO) < 0) _exit(127);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+        }
+        /* Hold nothing of the owner's open: not its pipes, not its sockets. */
+        for (int fd = 3; fd < max_fd; fd++) close(fd);
+        if (chdir("/") != 0) { /* not fatal */ }
+        execv(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+
+    close(sv[1]);
+    if (devnull >= 0) close(devnull);
+    inst->watcher_fd = sv[0];
+    inst->watcher_pid = pid;
+    register_watcher_fd(sv[0]);
+    return 0;
+}
+
+/* Tell the watchdog the owner has dealt with the server, and wait for it. */
+static void release_watchdog(rpgl_instance *inst) {
+    if (inst->watcher_fd >= 0) {
+        static const char msg[] = "released\n";
+#if defined(MSG_NOSIGNAL)
+        send(inst->watcher_fd, msg, sizeof(msg) - 1, MSG_NOSIGNAL);
+#else
+        send(inst->watcher_fd, msg, sizeof(msg) - 1, 0);   /* SO_NOSIGPIPE is set */
+#endif
+        unregister_watcher_fd(inst->watcher_fd);
+        close(inst->watcher_fd);
+        inst->watcher_fd = -1;
+    }
+    if (inst->watcher_pid > 0) {
+        /* It exits at once; bounded anyway, in case it was stopped or killed. */
+        for (int waited = 0; waited < 2000; waited += 10) {
+            pid_t r = waitpid(inst->watcher_pid, NULL, WNOHANG);
+            if (r == inst->watcher_pid || (r < 0 && errno == ECHILD)) break;
+            usleep(10000);
+        }
+        inst->watcher_pid = 0;
+    }
+}
+
+/* ---- Temp root and sweep ---- */
+
+static const char *temp_root_for(const rpgl_options *opts) {
+    if (opts && opts->temp_root && opts->temp_root[0]) return opts->temp_root;
+    const char *env = getenv("RUSTYPGLITE_TMPDIR");
+    if (env && env[0]) return env;
+    return "/tmp";
+}
+
+enum { SWEEP_LIVE, SWEEP_DURABLE, SWEEP_LEGACY, SWEEP_STARTING, SWEEP_SKIPPED,
+       SWEEP_RECLAIMED, SWEEP_FAILED };
+
+/*
+ * A dir with no owner.json is left alone whatever its age.  Age only decides
+ * whether it is worth MENTIONING: a young one is almost certainly a start in
+ * progress (owner.json is written after initdb), not an old rustypglite's.
+ */
+#define LEGACY_NOTICE_AGE_SECONDS 120
+
+/*
+ * Judge one rpgl_* dir, and reclaim it only if owner.json proves both its
+ * owner and its watchdog are dead.  Nothing else is ever touched: not a live
+ * owner's dir however old, not a dir without owner.json, not a durable one,
+ * not one whose owner we cannot see (another PID namespace).
+ */
+static int sweep_one_with(const char *path, char *buf);
+
+static int sweep_one(const char *path) {
+    char *buf = malloc(OWNER_JSON_MAX);
+    if (!buf) return SWEEP_SKIPPED;
+    int verdict = sweep_one_with(path, buf);
+    free(buf);
+    return verdict;
+}
+
+static int sweep_one_with(const char *path, char *buf) {
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;   /* not a dir: ignore */
+    if (st.st_uid != geteuid() || (st.st_mode & 022)) return SWEEP_SKIPPED;
+
+    int rc = read_owner_file(path, buf, OWNER_JSON_MAX);
+    if (rc == -1)
+        return time(NULL) - st.st_mtime < LEGACY_NOTICE_AGE_SECONDS ? SWEEP_STARTING : SWEEP_LEGACY;
+    if (rc != 0) return SWEEP_SKIPPED;
+
+    if (json_get_bool(buf, "durable") != 0) {
+        /* true, or unreadable: either way not ours to judge */
+        return json_get_bool(buf, "durable") == 1 ? SWEEP_DURABLE : SWEEP_SKIPPED;
+    }
+
+    long owner_pid = 0, watcher_pid = 0;
+    char owner_start[64] = "", watcher_start[64] = "", boot[128] = "", ns[128] = "";
+    if (json_get_long(buf, "owner_pid", &owner_pid) != 0
+        || json_get_string(buf, "owner_start", owner_start, sizeof(owner_start)) != 0
+        || json_get_string(buf, "boot_id", boot, sizeof(boot)) != 0
+        || json_get_string(buf, "pid_ns", ns, sizeof(ns)) != 0)
+        return SWEEP_SKIPPED;
+    json_get_long(buf, "watcher_pid", &watcher_pid);
+    json_get_string(buf, "watcher_start", watcher_start, sizeof(watcher_start));
+
+    int owner = process_state(owner_pid, owner_start, boot, ns);
+    if (owner == PROC_ALIVE) return SWEEP_LIVE;
+    if (owner == PROC_UNKNOWN) return SWEEP_SKIPPED;
+
+    /* Owner dead.  A live watchdog is already cleaning up: leave it to it. */
+    if (watcher_pid > 0 && process_state(watcher_pid, watcher_start, boot, ns) != PROC_DEAD)
+        return SWEEP_LIVE;
+
+    if (stop_server_in_dir(path, 0) != 0) return SWEEP_FAILED;
+    if (json_get_bool(buf, "owns_data_dir") == 1 && remove_tree(path) != 0)
+        return SWEEP_FAILED;
+    return SWEEP_RECLAIMED;
+}
+
+static int sweep_root(const char *temp_root, rpgl_sweep_result *out, int *old_legacy) {
+    rpgl_sweep_result res;
+    memset(&res, 0, sizeof(res));
+    if (out) *out = res;
+    if (old_legacy) *old_legacy = 0;
+    if (!temp_root || !temp_root[0]) temp_root = temp_root_for(NULL);
+
+    /*
+     * One sweeper at a time, per user and root.  Non-blocking: if someone
+     * else is sweeping, their sweep covers ours and we do not wait for it.
+     */
+    char lock_path[4096];
+    snprintf(lock_path, sizeof(lock_path), "%s/rpgl_sweep.%d.lock", temp_root, (int)geteuid());
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return RPGL_ERR_INIT;
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        close(lock_fd);
+        return RPGL_ERR_ALREADY;
+    }
+
+    DIR *d = opendir(temp_root);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strncmp(de->d_name, "rpgl_", 5) != 0) continue;
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", temp_root, de->d_name);
+            int verdict = sweep_one(path);
+            if (verdict < 0) continue;
+            res.examined++;
+            switch (verdict) {
+                case SWEEP_LIVE:      res.live++; break;
+                case SWEEP_DURABLE:   res.durable++; break;
+                case SWEEP_LEGACY:    res.legacy++; if (old_legacy) (*old_legacy)++; break;
+                case SWEEP_STARTING:  res.legacy++; break;
+                case SWEEP_SKIPPED:   res.skipped++; break;
+                case SWEEP_RECLAIMED: res.reclaimed++; break;
+                case SWEEP_FAILED:    res.failed++; break;
+            }
+        }
+        closedir(d);
+    }
+
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    if (out) *out = res;
+    return RPGL_OK;
+}
+
+int rpgl_sweep(const char *temp_root, rpgl_sweep_result *out) {
+    return sweep_root(temp_root, out, NULL);
+}
+
+/* The sweep every start runs.  Says once per process if it left legacy dirs. */
+static void sweep_on_start(const char *temp_root) {
+    static int legacy_reported = 0;
+    rpgl_sweep_result res;
+    int old_legacy = 0;
+    if (sweep_root(temp_root, &res, &old_legacy) != RPGL_OK) return;
+    if (old_legacy > 0 && !legacy_reported) {
+        legacy_reported = 1;
+        fprintf(stderr,
+                "rustypglite: left %d old data dir(s) in %s alone: they have no owner.json "
+                "(made by rustypglite 0.1.x, or by a start that was killed before it "
+                "finished), so nothing can say whether their owner is alive. Stop one "
+                "with `rustypglite stop <dir>`.\n",
+                old_legacy, temp_root);
+    }
+}
+
+int rpgl_stop_dir(const char *data_dir) {
+    if (!data_dir || !data_dir[0]) return RPGL_ERR_INIT;
+
+    struct stat st;
+    if (lstat(data_dir, &st) != 0 || !S_ISDIR(st.st_mode)) return RPGL_ERR_INIT;
+    if (st.st_uid != geteuid()) return RPGL_ERR_INIT;
+
+    char *buf = malloc(OWNER_JSON_MAX);
+    if (!buf) return RPGL_ERR_OOM;
+    int owns = read_owner_file(data_dir, buf, OWNER_JSON_MAX) == 0
+            && json_get_bool(buf, "owns_data_dir") == 1;
+    free(buf);
+
+    if (stop_server_in_dir(data_dir, 0) != 0) return RPGL_ERR_STOP;
+
+    /* Delete only what owner.json says we created; never someone's own data dir. */
+    if (owns && remove_tree(data_dir) != 0) return RPGL_ERR_STOP;
+    return RPGL_OK;
+}
+
+/* ---- Public API ---- */
+
+static int start_impl(const rpgl_options *opts, rpgl_instance **out, int *dir_lock) {
+    if (!out) return RPGL_ERR_INIT;
+
+    const char *temp_root = temp_root_for(opts);
+    int durable = opts ? opts->durable : 0;
+
+    /* Reclaim servers whose owners died (and nothing else — see sweep_one). */
+    sweep_on_start(temp_root);
 
     char *bin_dir = find_pg_bin_dir();
-    if (!bin_dir) { release_startup_lock(lock_fd); return RPGL_ERR_INIT; }
+    if (!bin_dir) return RPGL_ERR_INIT;
 
     rpgl_instance *inst = calloc(1, sizeof(rpgl_instance));
-    if (!inst) { free(bin_dir); release_startup_lock(lock_fd); return RPGL_ERR_OOM; }
+    if (!inst) { free(bin_dir); return RPGL_ERR_OOM; }
 
     inst->pg_bin_dir = bin_dir;
+    inst->watcher_fd = -1;
+    inst->durable = durable;
+    random_token(inst->token, sizeof(inst->token));
     inst->db_name = strdup((opts && opts->db_name) ? opts->db_name : "postgres");
     inst->port = (opts && opts->port > 0) ? opts->port : find_free_port();
 
@@ -495,17 +1209,60 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
 
     /* ── Data directory ── */
     if (opts && opts->data_dir) {
-        inst->data_dir = strdup(opts->data_dir);
-        inst->owns_data_dir = 0;
-    } else {
-        char tmpl[] = "/tmp/rpgl_XXXXXX";
-        char *tmpdir = mkdtemp(tmpl);
-        if (!tmpdir) {
-            set_error(inst, "mkdtemp failed: %s", strerror(errno));
+        /*
+         * Hold an exclusive lock on the dir for the whole start, so two
+         * starts racing on it cannot both pass the check below — and the
+         * loser's failure path cannot stop the winner's server.  Created if
+         * missing, parents included, as initdb used to (it accepts an
+         * existing empty dir); close-on-exec, so neither pg_ctl nor postgres
+         * inherits it.  Only a lock someone else holds means "already
+         * running"; failing to create, open or lock the dir is a setup error.
+         */
+        char mk[4096];
+        snprintf(mk, sizeof(mk), "%s", opts->data_dir);
+        for (char *p = mk + 1; *p; p++) {
+            if (*p != '/') continue;
+            *p = '\0';
+            mkdir(mk, 0700);          /* EEXIST is fine; a real failure shows at open() */
+            *p = '/';
+        }
+        mkdir(mk, 0700);
+        *dir_lock = open(opts->data_dir, O_RDONLY | O_CLOEXEC);
+        if (*dir_lock < 0 || flock(*dir_lock, LOCK_EX | LOCK_NB) != 0) {
+            int busy = *dir_lock >= 0 && errno == EWOULDBLOCK;
             free(inst->pg_bin_dir);
             free(inst->db_name);
             free(inst);
-            release_startup_lock(lock_fd);
+            return busy ? RPGL_ERR_ALREADY : RPGL_ERR_INIT;
+        }
+        /*
+         * A server is already running here (someone else's, or a durable one
+         * started earlier).  Touch NOTHING: not its owner.json, and — since
+         * our failure path stops whatever runs in the dir — not the server.
+         */
+        if (is_postmaster_of(postmaster_pid(opts->data_dir), opts->data_dir)) {
+            free(inst->pg_bin_dir);
+            free(inst->db_name);
+            free(inst);
+            return RPGL_ERR_ALREADY;
+        }
+        inst->data_dir = strdup(opts->data_dir);
+        inst->owns_data_dir = 0;
+    } else {
+        /*
+         * A durable auto dir is named rpgldur_*, not rpgl_*: no sweep looks
+         * at it (it would leave it alone anyway), and neither do rustypglite
+         * 0.1.x's ten-minute "stale" cleanup nor scripts that reap
+         * /tmp/rpgl_* — a stopped or idle durable server gets no heartbeat.
+         */
+        char tmpl[4096];
+        snprintf(tmpl, sizeof(tmpl), "%s/%s", temp_root,
+                 durable ? "rpgldur_XXXXXX" : "rpgl_XXXXXX");
+        mkdir(temp_root, 0700);   /* a custom root may not exist yet */
+        char *tmpdir = mkdtemp(tmpl);
+        if (!tmpdir) {
+            set_error(inst, "mkdtemp failed: %s", strerror(errno));
+            rpgl_stop(inst);
             return RPGL_ERR_INIT;
         }
         inst->data_dir = strdup(tmpdir);
@@ -515,18 +1272,21 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
     /* Socket dir = data dir (postgres creates .s.PGSQL.PORT here) */
     inst->socket_dir = strdup(inst->data_dir);
 
-    /*
-     * Our data dir now exists and is seconds old, so the age guard protects it
-     * from any other process's cleanup.  Release the startup lock before the
-     * slow initdb/boot so concurrent starts are not serialised behind us.
-     */
-    release_startup_lock(lock_fd);
-    lock_fd = -1;
-
     /* ── Set LD_LIBRARY_PATH for child processes ── */
     char lib_path[4096];
     snprintf(lib_path, sizeof(lib_path), "%s/../lib", bin_dir);
     setenv("LD_LIBRARY_PATH", lib_path, 1);
+
+    /*
+     * ── Bind the server to us, before anything can outlive us ──
+     * From here on, however this process ends, the watchdog stops the server
+     * and removes the dir.
+     */
+    if (!durable && spawn_watchdog(inst) != 0) {
+        set_error(inst, "could not start the watchdog: %s", strerror(errno));
+        rpgl_stop(inst);
+        return RPGL_ERR_INIT;
+    }
 
     /* ── initdb (if needed) ── */
     char version_file[4096];
@@ -564,6 +1324,16 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
         }
     }
 
+    /*
+     * ── owner.json ── (after initdb, which refuses a non-empty directory)
+     * The sweep reads this to decide whether our server may be reclaimed.
+     */
+    if (write_owner_file(inst) != 0) {
+        set_error(inst, "could not write %s: %s", OWNER_FILE, strerror(errno));
+        rpgl_stop(inst);
+        return RPGL_ERR_INIT;
+    }
+
     /* ── Tweak postgresql.conf for speed ── */
     char conf_path[4096];
     snprintf(conf_path, sizeof(conf_path), "%s/postgresql.conf", inst->data_dir);
@@ -591,9 +1361,12 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
 
     /* Check if pg_ctl exists; if not, start postgres directly */
     if (access(pg_ctl_path, X_OK) == 0) {
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%d", inst->port);
-
+        /*
+         * pg_ctl DAEMONISES the postmaster: it forks, setsid()s, execs
+         * /bin/sh -c "exec postgres ...", and exits.  So the postmaster's
+         * parent is init (PPID 1) even while we are alive — a PPID of 1 is
+         * NOT evidence of an orphan.  owner.json is.
+         */
         const char *argv[] = {
             pg_ctl_path,
             "start",
@@ -612,15 +1385,7 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
             return RPGL_ERR_START;
         }
 
-        /* Read the PID from postmaster.pid */
-        char pidfile[4096];
-        snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", inst->data_dir);
-        FILE *f = fopen(pidfile, "r");
-        if (f) {
-            if (fscanf(f, "%d", &inst->pg_pid) != 1)
-                inst->pg_pid = 0;
-            fclose(f);
-        }
+        inst->pg_pid = postmaster_pid(inst->data_dir);
     } else {
         /* No pg_ctl — start postgres directly */
         char postgres_path[4096];
@@ -655,6 +1420,7 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
             _exit(127);
         }
         inst->pg_pid = pid;
+        inst->pg_child = pid;
     }
 
     /* ── Wait for ready ── */
@@ -671,9 +1437,26 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
              inst->socket_dir, inst->port, inst->db_name);
     inst->conn_string = strdup(cs);
 
-    track_instance(inst);
+    /* A durable server outlives us on purpose: no stop at exit either. */
+    if (!durable) track_instance(inst);
     *out = inst;
     return RPGL_OK;
+}
+
+int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
+    int dir_lock = -1;
+    int rc = start_impl(opts, out, &dir_lock);
+    if (dir_lock >= 0) close(dir_lock);   /* releases the flock */
+    return rc;
+}
+
+static void free_instance(rpgl_instance *inst) {
+    free(inst->data_dir);
+    free(inst->socket_dir);
+    free(inst->db_name);
+    free(inst->pg_bin_dir);
+    free(inst->conn_string);
+    free(inst);
 }
 
 int rpgl_stop(rpgl_instance *inst) {
@@ -681,50 +1464,58 @@ int rpgl_stop(rpgl_instance *inst) {
 
     untrack_instance(inst);
 
-    /* Try pg_ctl stop first */
-    if (inst->pg_bin_dir && inst->data_dir) {
-        char pg_ctl_path[4096];
-        snprintf(pg_ctl_path, sizeof(pg_ctl_path), "%s/pg_ctl", inst->pg_bin_dir);
+    /* Attached with rpgl_connect_existing: someone else's server. */
+    if (inst->borrowed) {
+        free_instance(inst);
+        return RPGL_OK;
+    }
 
-        if (access(pg_ctl_path, X_OK) == 0) {
-            const char *argv[] = {
-                pg_ctl_path, "stop",
-                "-D", inst->data_dir,
-                "-m", "fast",
-                "-w",
-                "-t", "5",
-                NULL
-            };
-            run_cmd(1, argv);
-        } else if (inst->pg_pid > 0) {
-            /* No pg_ctl — signal directly */
-            kill(inst->pg_pid, SIGTERM);
-            int status;
-            for (int i = 0; i < 50; i++) {
-                if (waitpid(inst->pg_pid, &status, WNOHANG) > 0) break;
-                usleep(100000);
-            }
-            /* Force kill if still alive */
-            if (kill(inst->pg_pid, 0) == 0) {
-                kill(inst->pg_pid, SIGKILL);
-                waitpid(inst->pg_pid, &status, 0);
-            }
+    int rc = RPGL_OK;
+    if (inst->data_dir) {
+        if (stop_server_in_dir(inst->data_dir, inst->pg_child) != 0) {
+            rc = RPGL_ERR_STOP;
+        } else if (inst->owns_data_dir) {
+            /*
+             * Only a dir that is still this start's (owner.json carries our
+             * token), or one we never got as far as claiming.  Someone may
+             * have stopped it with rpgl_stop_dir and the name been reused.
+             */
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", inst->data_dir, OWNER_FILE);
+            struct stat st;
+            int unclaimed = lstat(path, &st) != 0 && errno == ENOENT;
+            if (unclaimed || owner_token_is(inst->data_dir, inst->token))
+                remove_tree(inst->data_dir);
+        } else if (owner_token_is(inst->data_dir, inst->token)) {
+            /* A dir we keep: leave no stale claim on it behind. */
+            char path[4096];
+            snprintf(path, sizeof(path), "%s/%s", inst->data_dir, OWNER_FILE);
+            unlink(path);
         }
     }
 
-    /* Clean up data directory */
-    if (inst->owns_data_dir && inst->data_dir) {
-        char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", inst->data_dir);
-        system(cmd);
+    if (rc == RPGL_OK) {
+        /* Only now: the watchdog must not stand down before the server is down. */
+        release_watchdog(inst);
+    } else if (inst->watcher_fd >= 0) {
+        /* We could not stop it: hang up without "released", so the watchdog tries. */
+        unregister_watcher_fd(inst->watcher_fd);
+        close(inst->watcher_fd);
+        inst->watcher_fd = -1;
     }
 
-    free(inst->data_dir);
-    free(inst->socket_dir);
-    free(inst->db_name);
-    free(inst->pg_bin_dir);
-    free(inst->conn_string);
-    free(inst);
+    free_instance(inst);
+    return rc;
+}
+
+int rpgl_detach(rpgl_instance *inst) {
+    if (!inst) return RPGL_ERR_INIT;
+    untrack_instance(inst);
+    /*
+     * A non-durable server stays bound to this process: its watchdog socket
+     * is deliberately left open, so the server still goes when we do.
+     */
+    free_instance(inst);
     return RPGL_OK;
 }
 
@@ -769,7 +1560,9 @@ int rpgl_connect_existing(const char *data_dir, rpgl_instance **out) {
     inst->pg_bin_dir = find_pg_bin_dir();
     inst->port = port;
     inst->owns_data_dir = 0;  /* don't delete — we didn't create it */
-    inst->pg_pid = 0;         /* don't manage — we didn't start it */
+    inst->borrowed = 1;       /* don't stop — we didn't start it */
+    inst->pg_pid = 0;
+    inst->watcher_fd = -1;
 
     char cs[4096];
     snprintf(cs, sizeof(cs),

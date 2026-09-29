@@ -43,13 +43,42 @@ typedef struct rpgl_options {
     int         port;           /* 0 = auto-assign (find free port) */
     int         silent;         /* 1 = suppress postgres log output */
     int         keep_data;      /* 1 = don't delete data_dir on stop */
+    /*
+     * 1 = a long-lived server that is NOT bound to this process: no watchdog,
+     * no stop at exit, never reclaimed by a sweep ("durable": true in its
+     * owner.json).  Only rpgl_stop / rpgl_stop_dir stop it.  Its auto dir is
+     * <temp_root>/rpgldur_XXXXXX, outside anything that scans rpgl_*.
+     * Appended last so the fields above keep their offsets.
+     */
+    int         durable;
+    /* Where auto data dirs (rpgl_XXXXXX) go and what the start-up sweep scans.
+     * NULL = $RUSTYPGLITE_TMPDIR, else /tmp. */
+    const char *temp_root;
 } rpgl_options;
+
+/* ---- Sweep result ---- */
+typedef struct rpgl_sweep_result {
+    int examined;   /* rpgl_* dirs looked at */
+    int reclaimed;  /* owner and watchdog dead: server stopped, dir removed */
+    int live;       /* owner (or its watchdog) still running: left alone */
+    int durable;    /* an rpgl_* dir whose owner.json says durable: left alone.  Normally
+                       0 — durable auto dirs are rpgldur_*, which no sweep examines */
+    int legacy;     /* no owner.json (older rustypglite, or mid-start): left alone */
+    int skipped;    /* not ours to judge (other user, other PID namespace, unreadable) */
+    int failed;     /* owner dead, but the server would not stop or the dir stay removed */
+} rpgl_sweep_result;
 
 /* ---- Lifecycle ---- */
 
 /*
  * Start an embedded PostgreSQL instance.
+ * - RPGL_ERR_ALREADY, touching nothing, if a server is already running in
+ *   opts->data_dir
+ * - Sweeps the temp root first (see rpgl_sweep)
  * - Runs initdb if the data directory doesn't exist
+ * - Writes owner.json into the data dir: who started it (PID + start time)
+ * - Unless durable: binds the server to this process with a watchdog, so it
+ *   is stopped and its dir removed however this process ends (SIGKILL too)
  * - Starts postgres listening on a unix socket
  * - Waits until accepting connections
  * - opts can be NULL for all defaults
@@ -59,16 +88,43 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out);
 
 /*
  * Connect to an already-running instance by data directory.
- * Reads postmaster.pid to get port/socket info. Does NOT start a server.
+ * Reads postmaster.pid to get port/socket info. Does NOT start a server,
+ * and rpgl_stop on the result frees the handle without stopping the server.
  * Use this for shared-server-across-workers patterns.
  */
 int rpgl_connect_existing(const char *data_dir, rpgl_instance **out);
 
 /*
  * Stop the PostgreSQL instance and free resources.
- * Unless keep_data was set, the data directory is deleted.
+ * Unless keep_data was set (or data_dir was supplied), the data directory is
+ * deleted.  Stops a durable instance too: stopping is always explicit.
  */
 int rpgl_stop(rpgl_instance *inst);
+
+/*
+ * Free the handle WITHOUT stopping the server.  For a durable instance this
+ * leaves it running after the process exits.  A non-durable server stays
+ * bound to this process and is still stopped when it exits.
+ */
+int rpgl_detach(rpgl_instance *inst);
+
+/*
+ * Stop the server running in data_dir, by path — for scripts, and for a
+ * process other than the owner (`rustypglite stop <dir>`).  Deletes the dir
+ * only when its owner.json says rustypglite created it.  RPGL_OK when no
+ * server is left running there.
+ */
+int rpgl_stop_dir(const char *data_dir);
+
+/*
+ * Reclaim servers whose owner is dead, under temp_root (NULL = the default,
+ * $RUSTYPGLITE_TMPDIR else /tmp).  Only rpgl_* dirs whose owner.json proves
+ * the owner (PID + start time) and its watchdog are both gone; never a live
+ * owner's dir whatever its age, a durable one, or one without owner.json.
+ * rpgl_start runs this itself.  RPGL_ERR_ALREADY if another process is
+ * sweeping the same root right now.
+ */
+int rpgl_sweep(const char *temp_root, rpgl_sweep_result *out);
 
 /* ---- Connection info ---- */
 
