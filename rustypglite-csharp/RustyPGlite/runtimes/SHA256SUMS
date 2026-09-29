@@ -4,7 +4,7 @@
 # The linux-x64 one also carries a build-provenance attestation:
 #   gh attestation verify linux-x64/native/librustypglite.so --repo new-axis/rustypglite
 #
-# linux-x64: .github/workflows/linux.yml, ubuntu-22.04, run 36504592584 (commit c9f9cb0); needs glibc >= 2.34
-# osx-arm64: .github/workflows/macos.yml, macos-14, run 36504592484 (commit c9f9cb0)
-2234327e8d346222719519ecf959653d5e732e917e54fa5714647dc1e59310e6  linux-x64/native/librustypglite.so
-746767486dfe224fcc475bd1049864d47752281220bc82088660d36ea5852de8  osx-arm64/native/librustypglite.dylib
+# linux-x64: .github/workflows/linux.yml, ubuntu-22.04, run 36505928820 (commit af0b41c); needs glibc >= 2.34
+# osx-arm64: .github/workflows/macos.yml, macos-14, run 36505928758 (commit af0b41c)
+318dfde17bfc7c638cc8b0728886a3eb956461ef8644f845ebc1e689019392b1  linux-x64/native/librustypglite.so
+ccfb0db06c11ea8955536a1967cf5bbbf2cfed4ccd0c5e722a270b561fdb547b  osx-arm64/native/librustypglite.dylib
