@@ -395,3 +395,38 @@ fn a_durable_server_survives_its_handle() {
     rustypglite::stop_dir(&dir).unwrap();
     assert!(!alive(pm));
 }
+
+#[test]
+fn the_watchdog_keeps_a_live_owners_dir_looking_fresh() {
+    // For rustypglite 0.1.x processes on the same machine, which still take
+    // a dir older than ten minutes (with no answering socket) to be stale.
+    let root = Root::new("heartbeat");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["owner_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env("RPGL_CHILD_ROOT", root.path())
+        .env("RPGL_CHILD_DURABLE", "0")
+        .env("RUSTYPGLITE_HEARTBEAT_SECONDS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let dir = BufReader::new(stdout)
+        .lines()
+        .map(|l| l.unwrap())
+        .find_map(|l| l.split_once("RPGL_DIR=").map(|(_, d)| d.to_string()))
+        .expect("owner child started a server");
+    let mut owner = Owner { child, dir };
+
+    let old = Command::new("touch").args(["-t", "202001010000", &owner.dir]).status().unwrap();
+    assert!(old.success());
+    let age = || {
+        std::fs::metadata(&owner.dir).unwrap().modified().unwrap().elapsed().unwrap_or_default()
+    };
+    assert!(age() > Duration::from_secs(3600));
+    assert!(
+        wait_until(Duration::from_secs(5), || age() < Duration::from_secs(60)),
+        "the dir was not touched"
+    );
+    owner.kill9();
+}

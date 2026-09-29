@@ -172,6 +172,10 @@ watchdog blocks reading it.
   rustypglite created it. It acts only if the dir's `owner.json` still carries
   its start's random token (or has none yet: the owner died during initdb), so
   it can never act on a dir that was since reused.
+- While the owner lives, the watchdog touches the data dir every 60 s. This
+  version never judges a dir by age, but 0.1.x did (older than ten minutes
+  with no answering socket meant "stale"), and a machine runs mixed versions
+  for a while: an idle live server's dir must never look old to them.
 - The watchdog is in its own session and ignores HUP/INT/QUIT/TERM/PIPE, so a
   Ctrl-C to the test runner's process group, or a closed terminal, does not
   take it down with the owner. It holds none of the owner's other file
@@ -240,6 +244,12 @@ watchdog, no `atexit` stop, never swept; `rpgl_stop()` or `rpgl_stop_dir()`
 **The temp root** is `rpgl_options.temp_root`, else `$RUSTYPGLITE_TMPDIR`,
 else `/tmp`. Tests use their own root so that their sweeps can only ever see
 their own servers.
+
+**Test hosts are killed, not stopped.** `dotnet test` ends its test host
+with SIGKILL, so nothing in the host — `atexit`, a signal handler, a
+finalizer, a DI container's disposal — runs at the end of a run. Every server
+still open then is the watchdog's to stop. That is the normal path, not the
+exceptional one.
 
 **What is not covered:** a server whose owner *and* watchdog were both
 SIGKILLed stays up until the next start (or `rustypglite sweep`) on that

@@ -745,8 +745,17 @@ static int remove_tree(const char *dir) {
 
 /* ---- The watchdog ---- */
 /*
- * Runs as: /bin/sh -c WATCHDOG_SCRIPT rustypglite-watchdog DIR TOKEN PG_CTL OWNS
+ * Runs as: /bin/sh -c WATCHDOG_SCRIPT rustypglite-watchdog DIR TOKEN PG_CTL OWNS BEAT
  * with its stdin one end of a socketpair whose other end only the owner holds.
+ *
+ * While the owner lives, a background loop touches the dir every BEAT
+ * seconds.  Nothing in this version judges a dir by age, but rustypglite
+ * 0.1.x did (older than ten minutes with no answering socket = stale), and
+ * a machine runs mixed versions for a while: an idle live server's dir must
+ * never look old to them.  The loop ends with the watchdog (it checks $$),
+ * or when the dir is gone.  (The loop inherits the ignored TERM, hence
+ * kill -9; its current `sleep` may outlive it by up to BEAT seconds, holding
+ * nothing.)
  *
  * "released" means the owner stopped the server itself: exit untouched.  EOF
  * without it means the owner is gone: stop the server and, when the dir is
@@ -759,8 +768,13 @@ static int remove_tree(const char *dir) {
 static const char WATCHDOG_SCRIPT[] =
     "trap '' HUP INT QUIT TERM PIPE\n"
     "PATH=/usr/bin:/bin:$PATH\n"
-    "dir=$1 token=$2 pgctl=$3 owns=$4\n"
+    "dir=$1 token=$2 pgctl=$3 owns=$4 beat=$5\n"
+    "( while kill -0 $$ 2>/dev/null && [ -d \"$dir\" ]; do\n"
+    "    touch -c \"$dir\"; sleep \"$beat\"\n"
+    "  done ) </dev/null >/dev/null 2>&1 &\n"
+    "hb=$!\n"
     "IFS= read -r msg\n"
+    "kill -9 $hb 2>/dev/null\n"
     "[ \"$msg\" = released ] && exit 0\n"
     "if [ -f \"$dir/owner.json\" ]; then\n"
     "  grep -qF \"\\\"token\\\": \\\"$token\\\"\" \"$dir/owner.json\" || exit 0\n"
@@ -793,9 +807,13 @@ static void set_cloexec(int fd) {
 static int spawn_watchdog(rpgl_instance *inst) {
     char pg_ctl[4096];
     snprintf(pg_ctl, sizeof(pg_ctl), "%s/pg_ctl", inst->pg_bin_dir);
+    /* Heartbeat, seconds.  Overridable for tests only. */
+    char beat[16] = "60";
+    const char *beat_env = getenv("RUSTYPGLITE_HEARTBEAT_SECONDS");
+    if (beat_env && atoi(beat_env) > 0) snprintf(beat, sizeof(beat), "%d", atoi(beat_env));
     const char *argv[] = {
         "/bin/sh", "-c", WATCHDOG_SCRIPT, "rustypglite-watchdog",
-        inst->data_dir, inst->token, pg_ctl, inst->owns_data_dir ? "1" : "0",
+        inst->data_dir, inst->token, pg_ctl, inst->owns_data_dir ? "1" : "0", beat,
         NULL
     };
 

@@ -73,6 +73,12 @@ created it; a data dir you supplied is kept.
 `RUSTYPGLITE_TMPDIR` (or the `temp_root` / `TempRoot` / `tempRoot` option)
 moves the auto data dirs — and the sweep — out of `/tmp`.
 
+**If you wrote your own watchdog** around 0.1.x (a process holding a pipe
+from the owner, stopping the server on EOF, touching the dir so 0.1.x's
+cleanup would not take it): delete it when you move to 0.2. The library now
+does all three, from before initdb, for every binding. Running both at once
+is harmless — whichever acts second finds nothing left to do.
+
 **Upgrading from 0.1.x:** servers started by 0.1.x have no `owner.json`, so
 0.2 leaves them alone (nothing can tell whether their owner is alive) and says
 once per process how many old ones it saw. Stop those with
