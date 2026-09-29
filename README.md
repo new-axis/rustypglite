@@ -113,7 +113,7 @@ once per process how many old ones it saw. Stop those with
 
 | Platform | Status |
 |---|---|
-| linux-x64 | Supported. The prebuilt shim is committed, so consumers build with no Rust toolchain. It is built by the Linux workflow on Ubuntu 22.04 and needs glibc 2.35 or newer (see `runtimes/SHA256SUMS`). |
+| linux-x64 | Supported. The prebuilt shim is committed, so consumers build with no Rust toolchain. It is built by the Linux workflow on Ubuntu 22.04 and needs glibc 2.34 or newer (see `runtimes/SHA256SUMS`). |
 | osx-arm64 / osx-x64 | Builds; **not yet verified on real hardware** — see below. |
 | linux-arm64 | Should build; unverified. |
 | Windows | Not supported. The shim is POSIX (`fork`/`execv`/`dlopen`). |

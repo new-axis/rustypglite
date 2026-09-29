@@ -6,7 +6,7 @@
 # loaded on consumers' machines, and glibc symbol versions only go one way: a
 # shim built against a newer glibc will not load on an older one. Built on a
 # developer's Debian 13 it needed GLIBC_2.38 (the C23 fscanf/strtol aliases);
-# built here it needs what 22.04 has (2.35) or less. Moving this image forward
+# built here it needs no more than 22.04 has (2.35; 2.34 in practice). Moving this image forward
 # raises the floor for every consumer — do it on purpose.
 #
 # The artifact is attested (build provenance), and the committed copy is this
