@@ -32,4 +32,27 @@ internal static partial class NativeMethods
 
     [LibraryImport(LibName, EntryPoint = "rpglite_exec_sql", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int ExecSql(IntPtr pg, string? dbName, string sql);
+
+    [LibraryImport(LibName, EntryPoint = "rpglite_start_with", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr StartWith(string? dataDir, string? dbName, int port,
+        int keepData, int durable, string? tempRoot);
+
+    [LibraryImport(LibName, EntryPoint = "rpglite_stop_server")]
+    internal static partial void StopServer(IntPtr pg);
+
+    [LibraryImport(LibName, EntryPoint = "rpglite_detach")]
+    internal static partial void Detach(IntPtr pg);
+
+    [LibraryImport(LibName, EntryPoint = "rpglite_stop_dir", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int StopDir(string dataDir);
+
+    [LibraryImport(LibName, EntryPoint = "rpglite_sweep", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int Sweep(string? tempRoot, out SweepResult result);
+
+    /// <summary>Mirror of rpgl_sweep_result in pg_shim.h: seven int32s, in this order.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct SweepResult
+    {
+        public int Examined, Reclaimed, Live, Durable, Legacy, Skipped, Failed;
+    }
 }

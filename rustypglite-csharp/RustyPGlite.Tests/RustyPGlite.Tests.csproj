@@ -5,6 +5,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <!-- Program.cs supplies Main: the lifecycle tests re-run this assembly
+         (`dotnet RustyPGlite.Tests.dll hold <root>`) as an owner process to kill. -->
+    <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
 
   <ItemGroup>
