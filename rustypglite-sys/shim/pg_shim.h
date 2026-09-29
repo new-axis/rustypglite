@@ -46,8 +46,9 @@ typedef struct rpgl_options {
     /*
      * 1 = a long-lived server that is NOT bound to this process: no watchdog,
      * no stop at exit, never reclaimed by a sweep ("durable": true in its
-     * owner.json).  Only rpgl_stop / rpgl_stop_dir stop it.  Appended last so
-     * the fields above keep their offsets.
+     * owner.json).  Only rpgl_stop / rpgl_stop_dir stop it.  Its auto dir is
+     * <temp_root>/rpgldur_XXXXXX, outside anything that scans rpgl_*.
+     * Appended last so the fields above keep their offsets.
      */
     int         durable;
     /* Where auto data dirs (rpgl_XXXXXX) go and what the start-up sweep scans.
@@ -70,6 +71,8 @@ typedef struct rpgl_sweep_result {
 
 /*
  * Start an embedded PostgreSQL instance.
+ * - RPGL_ERR_ALREADY, touching nothing, if a server is already running in
+ *   opts->data_dir
  * - Sweeps the temp root first (see rpgl_sweep)
  * - Runs initdb if the data directory doesn't exist
  * - Writes owner.json into the data dir: who started it (PID + start time)

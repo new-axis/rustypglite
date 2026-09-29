@@ -36,6 +36,7 @@
 #include <pthread.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <libproc.h>
 #endif
 
 /* ---- Instance ---- */
@@ -52,6 +53,7 @@ struct rpgl_instance {
     int      borrowed;       /* from rpgl_connect_existing: never stop it */
     int      durable;        /* not bound to our lifetime, never swept */
     pid_t    pg_pid;         /* postmaster PID (0 if not running) */
+    pid_t    pg_child;       /* the postmaster, when it is our own child (no pg_ctl) */
     pid_t    watcher_pid;    /* the watchdog process (0 if none) */
     int      watcher_fd;     /* our end of the watchdog socket (-1 if none) */
     char     token[40];      /* identifies this start in owner.json */
@@ -84,7 +86,61 @@ static void cleanup_all_instances(void) {
     }
 }
 
+/*
+ * Every watchdog socket end this process holds, including those of detached
+ * instances, so that a forked child can let go of them all.
+ */
+#define MAX_WATCHER_FDS 1024
+static int g_watcher_fds[MAX_WATCHER_FDS];
+static int g_watcher_fd_count = 0;
+
+static void register_watcher_fd(int fd) {
+    pthread_mutex_lock(&g_instances_lock);
+    if (g_watcher_fd_count < MAX_WATCHER_FDS) g_watcher_fds[g_watcher_fd_count++] = fd;
+    pthread_mutex_unlock(&g_instances_lock);
+}
+
+static void unregister_watcher_fd(int fd) {
+    pthread_mutex_lock(&g_instances_lock);
+    for (int i = 0; i < g_watcher_fd_count; i++) {
+        if (g_watcher_fds[i] == fd) { g_watcher_fds[i] = g_watcher_fds[--g_watcher_fd_count]; break; }
+    }
+    pthread_mutex_unlock(&g_instances_lock);
+}
+
+/*
+ * fork() without exec copies our servers' handles into the child, but the
+ * child is not their owner:
+ *  - its exit() would run cleanup_all_instances and stop the PARENT's
+ *    servers, remove their dirs and release their watchdogs;
+ *  - its copy of each watchdog socket would keep the servers up until the
+ *    child, too, has exited.
+ * So the child forgets the instances and closes its copies.  It can still
+ * use a handle it inherited, and stop it explicitly with rpgl_stop().
+ */
+static void atfork_prepare(void) { pthread_mutex_lock(&g_instances_lock); }
+static void atfork_parent(void)  { pthread_mutex_unlock(&g_instances_lock); }
+static void atfork_child(void) {
+    for (int i = 0; i < g_instance_count; i++) {
+        if (g_instances[i]) {
+            g_instances[i]->watcher_fd = -1;
+            g_instances[i]->watcher_pid = 0;
+        }
+        g_instances[i] = NULL;
+    }
+    g_instance_count = 0;
+    for (int i = 0; i < g_watcher_fd_count; i++) close(g_watcher_fds[i]);
+    g_watcher_fd_count = 0;
+    pthread_mutex_init(&g_instances_lock, NULL);
+}
+
+static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
+static void register_atfork(void) {
+    pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+}
+
 static void track_instance(rpgl_instance *inst) {
+    pthread_once(&g_atfork_once, register_atfork);
     pthread_mutex_lock(&g_instances_lock);
     if (!g_atexit_registered) {
         atexit(cleanup_all_instances);
@@ -386,13 +442,14 @@ static void current_boot_id(char *out, size_t outsz) {
 #if defined(__linux__)
     read_small_file("/proc/sys/kernel/random/boot_id", out, outsz);
 #elif defined(__APPLE__)
-    struct timeval tv;
-    size_t len = sizeof(tv);
-    int mib[2] = { CTL_KERN, KERN_BOOTTIME };
-    if (sysctl(mib, 2, &tv, &len, NULL, 0) == 0)
-        snprintf(out, outsz, "%ld.%06ld", (long)tv.tv_sec, (long)tv.tv_usec);
-    else
-        out[0] = '\0';
+    /*
+     * NOT kern.boottime: that is derived from the wall clock and moves when
+     * the clock is stepped (NTP, wake from sleep).  The boot session UUID is
+     * fixed for the life of the boot.
+     */
+    size_t len = outsz;
+    if (sysctlbyname("kern.bootsessionuuid", out, &len, NULL, 0) != 0) out[0] = '\0';
+    else out[outsz - 1] = '\0';
 #else
     out[0] = '\0';
 #endif
@@ -649,8 +706,6 @@ static int process_state(long pid, const char *start, const char *boot, const ch
     current_boot_id(cur_boot, sizeof(cur_boot));
     current_pid_ns(cur_ns, sizeof(cur_ns));
 
-    /* A different boot: nothing recorded then can still be running. */
-    if (boot[0] && cur_boot[0] && strcmp(boot, cur_boot) != 0) return PROC_DEAD;
     /*
      * A different PID namespace (a container, a sandbox): the PID means
      * something else here, and "no such process" proves nothing.  Hands off.
@@ -661,8 +716,19 @@ static int process_state(long pid, const char *start, const char *boot, const ch
     int rc = proc_start_time((pid_t)pid, cur_start, sizeof(cur_start));
     if (rc == -1) return PROC_DEAD;
     if (rc != 0) return PROC_UNKNOWN;
-    /* Same PID, different start time: the PID was reused; the owner is gone. */
-    return strcmp(start, cur_start) == 0 ? PROC_ALIVE : PROC_DEAD;
+    /*
+     * PID and start time match: alive, whatever the boot id says.  A boot id
+     * that differs is only a tie-breaker, never the verdict on its own — if
+     * it is ever derived from something that moves (as kern.boottime does),
+     * trusting it alone would have a sweep stop a live server.
+     */
+    if (strcmp(start, cur_start) == 0) return PROC_ALIVE;
+    /*
+     * Same PID, different start time: the PID was reused (or, across a
+     * reboot, the start times are not even comparable).  The owner is gone.
+     */
+    (void)boot; (void)cur_boot;
+    return PROC_DEAD;
 }
 
 /* ---- Stopping a server by its data dir ---- */
@@ -687,28 +753,44 @@ static pid_t postmaster_pid(const char *dir) {
  */
 static int is_postmaster_of(pid_t pid, const char *dir) {
     if (pid <= 0) return 0;
-    waitpid(pid, NULL, WNOHANG);        /* reap it if it is our own child */
     if (kill(pid, 0) != 0 && errno == ESRCH) return 0;
+    char real[PATH_MAX];
 #if defined(__linux__)
-    char link[64], cwd[PATH_MAX], real[PATH_MAX];
+    char link[64], cwd[PATH_MAX];
     snprintf(link, sizeof(link), "/proc/%d/cwd", (int)pid);
     ssize_t n = readlink(link, cwd, sizeof(cwd) - 1);
     if (n < 0) return errno == ENOENT ? 0 : 1;   /* gone (or a zombie) vs. can't see */
     cwd[n] = '\0';
     if (!realpath(dir, real)) return 1;
     return strcmp(cwd, real) == 0;
+#elif defined(__APPLE__)
+    struct proc_vnodepathinfo vpi;
+    int n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof(vpi));
+    if (n != (int)sizeof(vpi)) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) return 0;
+        return 1;                                /* exists, but we cannot see it */
+    }
+    if (vpi.pvi_cdir.vip_path[0] == '\0') return 0;   /* a zombie has no cwd */
+    if (!realpath(dir, real)) return 1;
+    return strcmp(vpi.pvi_cdir.vip_path, real) == 0;
 #else
-    (void)dir;
+    (void)dir; (void)real;
     return 1;
 #endif
 }
 
-static int wait_gone(pid_t pid, const char *dir, int timeout_ms) {
-    for (int waited = 0; waited < timeout_ms; waited += 50) {
+/*
+ * child: the postmaster's PID when it is OUR child (started without pg_ctl),
+ * so it can be reaped; 0 otherwise.  Never waitpid() a PID read from a file:
+ * after PID reuse it could be one of the host's own children.
+ */
+static int wait_gone(pid_t pid, pid_t child, const char *dir, int timeout_ms) {
+    for (int waited = 0; waited <= timeout_ms; waited += 50) {
+        if (child > 0 && child == pid) waitpid(child, NULL, WNOHANG);
         if (!is_postmaster_of(pid, dir)) return 1;
         usleep(50000);
     }
-    return !is_postmaster_of(pid, dir);
+    return 0;
 }
 
 /*
@@ -717,15 +799,16 @@ static int wait_gone(pid_t pid, const char *dir, int timeout_ms) {
  * no binaries and trusts nothing but postmaster.pid and the process table.
  * Returns 0 when no server is running there any more, -1 otherwise.
  */
-static int stop_server_in_dir(const char *dir) {
+static int stop_server_in_dir(const char *dir, pid_t child) {
     pid_t pid = postmaster_pid(dir);
+    if (child > 0 && child == pid) waitpid(child, NULL, WNOHANG);
     if (!is_postmaster_of(pid, dir)) return 0;
 
     static const int sigs[] = { SIGINT, SIGQUIT, SIGKILL };
     static const int waits_ms[] = { 10000, 5000, 5000 };
     for (int i = 0; i < 3; i++) {
         if (kill(pid, sigs[i]) != 0 && errno == ESRCH) return 0;
-        if (wait_gone(pid, dir, waits_ms[i])) return 0;
+        if (wait_gone(pid, child, dir, waits_ms[i])) return 0;
     }
     return -1;
 }
@@ -779,14 +862,31 @@ static const char WATCHDOG_SCRIPT[] =
     "if [ -f \"$dir/owner.json\" ]; then\n"
     "  grep -qF \"\\\"token\\\": \\\"$token\\\"\" \"$dir/owner.json\" || exit 0\n"
     "fi\n"
+    "pm() { IFS= read -r p <\"$dir/postmaster.pid\" 2>/dev/null && echo \"$p\"; }\n"
+    "running() {\n"
+    "  if [ -x \"$pgctl\" ]; then \"$pgctl\" status -D \"$dir\" >/dev/null 2>&1; return; fi\n"
+    "  p=$(pm); [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null\n"
+    "}\n"
+    "stop() {\n"
+    "  if [ -x \"$pgctl\" ]; then\n"
+    "    \"$pgctl\" stop -D \"$dir\" -m fast -w -t 10 >/dev/null 2>&1 ||\n"
+    "      \"$pgctl\" stop -D \"$dir\" -m immediate -w -t 5 >/dev/null 2>&1\n"
+    "    return\n"
+    "  fi\n"
+    "  p=$(pm); [ -n \"$p\" ] || return\n"
+    "  for sig in INT QUIT; do\n"
+    "    kill -$sig \"$p\" 2>/dev/null || return\n"
+    "    i=0; while [ $i -lt 10 ] && kill -0 \"$p\" 2>/dev/null; do sleep 1; i=$((i + 1)); done\n"
+    "    kill -0 \"$p\" 2>/dev/null || return\n"
+    "  done\n"
+    "}\n"
     "n=0\n"
     "while [ $n -lt 5 ]; do\n"
     "  n=$((n + 1))\n"
-    "  \"$pgctl\" stop -D \"$dir\" -m fast -w -t 10 >/dev/null 2>&1 ||\n"
-    "    \"$pgctl\" stop -D \"$dir\" -m immediate -w -t 5 >/dev/null 2>&1\n"
+    "  stop\n"
     "  [ \"$owns\" = 1 ] || exit 0\n"
     "  [ -d \"$dir\" ] || exit 0\n"
-    "  if \"$pgctl\" status -D \"$dir\" >/dev/null 2>&1; then sleep 1; continue; fi\n"
+    "  if running; then sleep 1; continue; fi\n"
     "  rm -rf -- \"$dir\"\n"
     "  sleep 1\n"
     "done\n";
@@ -829,12 +929,17 @@ static int spawn_watchdog(rpgl_instance *inst) {
     { int one = 1; setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
 #endif
 
+    pthread_once(&g_atfork_once, register_atfork);
     int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
     struct rlimit rl;
     int max_fd = (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
                   && rl.rlim_cur < 65536) ? (int)rl.rlim_cur : 65536;
     sigset_t none;
     sigemptyset(&none);
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -844,6 +949,15 @@ static int spawn_watchdog(rpgl_instance *inst) {
     }
     if (pid == 0) {
         setsid();                       /* out of the owner's terminal and group */
+        /*
+         * The host's handlers are still installed until exec: set every
+         * signal to its default BEFORE unmasking, so a pending one cannot run
+         * the host's handler in this half-copied process.
+         */
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (sig == SIGKILL || sig == SIGSTOP) continue;
+            sigaction(sig, &dfl, NULL);
+        }
         sigprocmask(SIG_SETMASK, &none, NULL);
         if (dup2(sv[1], STDIN_FILENO) < 0) _exit(127);
         if (devnull >= 0) {
@@ -861,6 +975,7 @@ static int spawn_watchdog(rpgl_instance *inst) {
     if (devnull >= 0) close(devnull);
     inst->watcher_fd = sv[0];
     inst->watcher_pid = pid;
+    register_watcher_fd(sv[0]);
     return 0;
 }
 
@@ -873,6 +988,7 @@ static void release_watchdog(rpgl_instance *inst) {
 #else
         send(inst->watcher_fd, msg, sizeof(msg) - 1, 0);   /* SO_NOSIGPIPE is set */
 #endif
+        unregister_watcher_fd(inst->watcher_fd);
         close(inst->watcher_fd);
         inst->watcher_fd = -1;
     }
@@ -955,7 +1071,7 @@ static int sweep_one_with(const char *path, char *buf) {
     if (watcher_pid > 0 && process_state(watcher_pid, watcher_start, boot, ns) != PROC_DEAD)
         return SWEEP_LIVE;
 
-    if (stop_server_in_dir(path) != 0) return SWEEP_FAILED;
+    if (stop_server_in_dir(path, 0) != 0) return SWEEP_FAILED;
     if (json_get_bool(buf, "owns_data_dir") == 1 && remove_tree(path) != 0)
         return SWEEP_FAILED;
     return SWEEP_RECLAIMED;
@@ -1023,9 +1139,10 @@ static void sweep_on_start(const char *temp_root) {
     if (old_legacy > 0 && !legacy_reported) {
         legacy_reported = 1;
         fprintf(stderr,
-                "rustypglite: left %d old data dir(s) in %s alone: they have no owner.json, "
-                "so an older rustypglite made them and nothing can say whether their "
-                "owner is alive. Stop one with `rustypglite stop <dir>`.\n",
+                "rustypglite: left %d old data dir(s) in %s alone: they have no owner.json "
+                "(made by rustypglite 0.1.x, or by a start that was killed before it "
+                "finished), so nothing can say whether their owner is alive. Stop one "
+                "with `rustypglite stop <dir>`.\n",
                 old_legacy, temp_root);
     }
 }
@@ -1043,7 +1160,7 @@ int rpgl_stop_dir(const char *data_dir) {
             && json_get_bool(buf, "owns_data_dir") == 1;
     free(buf);
 
-    if (stop_server_in_dir(data_dir) != 0) return RPGL_ERR_STOP;
+    if (stop_server_in_dir(data_dir, 0) != 0) return RPGL_ERR_STOP;
 
     /* Delete only what owner.json says we created; never someone's own data dir. */
     if (owns && remove_tree(data_dir) != 0) return RPGL_ERR_STOP;
@@ -1079,11 +1196,29 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
 
     /* ── Data directory ── */
     if (opts && opts->data_dir) {
+        /*
+         * A server is already running here (someone else's, or a durable one
+         * started earlier).  Touch NOTHING: not its owner.json, and — since
+         * our failure path stops whatever runs in the dir — not the server.
+         */
+        if (is_postmaster_of(postmaster_pid(opts->data_dir), opts->data_dir)) {
+            free(inst->pg_bin_dir);
+            free(inst->db_name);
+            free(inst);
+            return RPGL_ERR_ALREADY;
+        }
         inst->data_dir = strdup(opts->data_dir);
         inst->owns_data_dir = 0;
     } else {
+        /*
+         * A durable auto dir is named rpgldur_*, not rpgl_*: no sweep looks
+         * at it (it would leave it alone anyway), and neither do rustypglite
+         * 0.1.x's ten-minute "stale" cleanup nor scripts that reap
+         * /tmp/rpgl_* — a stopped or idle durable server gets no heartbeat.
+         */
         char tmpl[4096];
-        snprintf(tmpl, sizeof(tmpl), "%s/rpgl_XXXXXX", temp_root);
+        snprintf(tmpl, sizeof(tmpl), "%s/%s", temp_root,
+                 durable ? "rpgldur_XXXXXX" : "rpgl_XXXXXX");
         mkdir(temp_root, 0700);   /* a custom root may not exist yet */
         char *tmpdir = mkdtemp(tmpl);
         if (!tmpdir) {
@@ -1246,6 +1381,7 @@ int rpgl_start(const rpgl_options *opts, rpgl_instance **out) {
             _exit(127);
         }
         inst->pg_pid = pid;
+        inst->pg_child = pid;
     }
 
     /* ── Wait for ready ── */
@@ -1290,7 +1426,7 @@ int rpgl_stop(rpgl_instance *inst) {
 
     int rc = RPGL_OK;
     if (inst->data_dir) {
-        if (stop_server_in_dir(inst->data_dir) != 0) {
+        if (stop_server_in_dir(inst->data_dir, inst->pg_child) != 0) {
             rc = RPGL_ERR_STOP;
         } else if (inst->owns_data_dir) {
             /*
@@ -1317,6 +1453,7 @@ int rpgl_stop(rpgl_instance *inst) {
         release_watchdog(inst);
     } else if (inst->watcher_fd >= 0) {
         /* We could not stop it: hang up without "released", so the watchdog tries. */
+        unregister_watcher_fd(inst->watcher_fd);
         close(inst->watcher_fd);
         inst->watcher_fd = -1;
     }

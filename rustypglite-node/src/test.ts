@@ -418,7 +418,8 @@ describe('no leaked servers', () => {
       assert.ok(report, 'not busy');
       console.log(`  ${JSON.stringify(report)}`);
       assert.deepEqual(report, {
-        examined: 4, reclaimed: 1, live: 1, durable: 1, legacy: 1, skipped: 0, failed: 0,
+        // C (durable) is rpgldur_*: outside the sweep altogether.
+        examined: 3, reclaimed: 1, live: 1, durable: 0, legacy: 1, skipped: 0, failed: 0,
       });
 
       assert.ok(!alive(deadPm) && !fs.existsSync(dead.dir), 'B reclaimed');

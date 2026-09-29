@@ -181,6 +181,40 @@ fn owner_child() {
     println!("RPGL_DIR={}", pg.data_dir());
     use std::io::Write;
     std::io::stdout().flush().unwrap();
+    if std::env::var("RPGL_CHILD_FORK_EXIT").as_deref() == Ok("1") {
+        // A child that forks WITHOUT exec and then exit()s runs the atexit
+        // handlers it inherited. They must not touch the parent's server.
+        extern "C" {
+            fn fork() -> i32;
+            fn exit(code: i32) -> !;
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        let pid = unsafe { fork() };
+        if pid == 0 {
+            unsafe { exit(0) };
+        }
+        let mut status = 0;
+        unsafe { waitpid(pid, &mut status, 0) };
+        println!("RPGL_FORKED=1");
+        std::io::stdout().flush().unwrap();
+    }
+    if std::env::var("RPGL_CHILD_FORK_HOLD").as_deref() == Ok("1") {
+        // A child that forks WITHOUT exec and lives on must not keep the
+        // server up once the real owner is gone.
+        extern "C" {
+            fn fork() -> i32;
+            fn _exit(code: i32) -> !;
+        }
+        let pid = unsafe { fork() };
+        if pid == 0 {
+            for _ in 0..120 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            unsafe { _exit(0) };
+        }
+        println!("RPGL_FORKCHILD={}", pid);
+        std::io::stdout().flush().unwrap();
+    }
     loop {
         std::thread::sleep(Duration::from_secs(1)); // until killed
     }
@@ -307,7 +341,8 @@ fn sweep_reclaims_only_dead_owners_servers() {
 
     assert_eq!(report.reclaimed, 2, "B and E");
     assert_eq!(report.live, 1, "A");
-    assert_eq!(report.durable, 1, "C");
+    assert_eq!(report.durable, 0, "C is rpgldur_*: outside the sweep altogether");
+    assert!(Path::new(&durable_dir).file_name().unwrap().to_str().unwrap().starts_with("rpgldur_"));
     assert_eq!(report.legacy, 1, "D");
     assert_eq!(report.skipped, 1, "F");
     assert_eq!(report.failed, 0);
@@ -429,4 +464,126 @@ fn the_watchdog_keeps_a_live_owners_dir_looking_fresh() {
         "the dir was not touched"
     );
     owner.kill9();
+}
+
+#[test]
+fn a_forked_child_exiting_leaves_the_parents_server_alone() {
+    let root = Root::new("forkexit");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["owner_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env("RPGL_CHILD_ROOT", root.path())
+        .env("RPGL_CHILD_DURABLE", "0")
+        .env("RPGL_CHILD_FORK_EXIT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map(|l| l.unwrap());
+    let dir = lines
+        .find_map(|l| l.split_once("RPGL_DIR=").map(|(_, d)| d.to_string()))
+        .expect("owner child started a server");
+    let mut owner = Owner { child, dir: dir.clone() };
+    let pm = postmaster_pid(&dir);
+    assert!(lines.any(|l| l.contains("RPGL_FORKED=1")), "the fork probe did not finish");
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(alive(pm), "the forked child's exit stopped the parent's server");
+    assert!(Path::new(&dir).join("owner.json").exists(), "the forked child's exit removed the dir");
+    let watcher: u32 = owner_field(&dir, "watcher_pid").parse().unwrap();
+    assert!(alive(watcher), "the forked child's exit released the parent's watchdog");
+
+    // And the parent's server still dies with the parent.
+    owner.kill9();
+    assert!(wait_until(Duration::from_secs(15), || !alive(pm) && !Path::new(&dir).exists()));
+}
+
+#[test]
+fn starting_on_a_dir_that_already_has_a_server_changes_nothing() {
+    let root = Root::new("occupied");
+    let user_dir = root.0.join("shared");
+    let first = EmbeddedPg::start_with(StartOptions {
+        data_dir: Some(user_dir.to_str().unwrap().to_string()),
+        temp_root: Some(root.path().to_string()),
+        durable: true,
+        silent: true,
+        ..Default::default()
+    })
+    .expect("first start");
+    let dir = first.data_dir().to_string();
+    let pm = postmaster_pid(&dir);
+    let token = owner_field(&dir, "token");
+
+    let second = EmbeddedPg::start_with(StartOptions {
+        data_dir: Some(dir.clone()),
+        temp_root: Some(root.path().to_string()),
+        silent: true,
+        ..Default::default()
+    });
+    assert!(second.is_err(), "a second server cannot start on an occupied dir");
+    assert!(alive(pm), "the failed start stopped the server that was already there");
+    assert_eq!(owner_field(&dir, "token"), token, "the failed start rewrote owner.json");
+    first.exec_sql("SELECT 1").expect("the first server still serves");
+
+    first.stop();
+    assert!(!alive(pm));
+}
+
+#[test]
+fn a_changed_boot_id_alone_does_not_make_a_live_owner_dead() {
+    // macOS derived the boot id from kern.boottime, which moves when the
+    // clock is stepped. Whatever the boot id says, a PID whose start time
+    // still matches is alive.
+    let root = Root::new("bootid");
+    let live = start_in(&root);
+    let live_dir = live.data_dir().to_string();
+    let ns = owner_field(&live_dir, "pid_ns");
+    let start = owner_field(&live_dir, "owner_start");
+
+    let other_boot = fake_dir(
+        &root,
+        "rpgl_otherboot",
+        Some(format!(
+            r#"{{"owner_pid": {}, "owner_start": "{}", "boot_id": "not-this-boot", "pid_ns": "{}",
+               "watcher_pid": 0, "watcher_start": "", "durable": false,
+               "owns_data_dir": true, "token": "x"}}"#,
+            std::process::id(),
+            start,
+            ns
+        )),
+    );
+
+    let report = rustypglite::sweep(Some(root.path())).unwrap().expect("not busy");
+    assert_eq!(report.reclaimed, 0, "{:?}", report);
+    assert!(other_boot.exists(), "a live owner's dir was reclaimed over a boot id");
+    drop(live);
+}
+
+#[test]
+fn a_forked_child_that_lives_on_does_not_keep_the_server_up() {
+    let root = Root::new("forkhold");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["owner_child", "--exact", "--nocapture", "--test-threads=1"])
+        .env("RPGL_CHILD_ROOT", root.path())
+        .env("RPGL_CHILD_DURABLE", "0")
+        .env("RPGL_CHILD_FORK_HOLD", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map(|l| l.unwrap());
+    let dir = lines
+        .find_map(|l| l.split_once("RPGL_DIR=").map(|(_, d)| d.to_string()))
+        .expect("owner child started a server");
+    let forked: u32 = lines
+        .find_map(|l| l.split_once("RPGL_FORKCHILD=").map(|(_, p)| p.trim().parse().unwrap()))
+        .expect("fork probe reported its child");
+    let mut owner = Owner { child, dir: dir.clone() };
+    let pm = postmaster_pid(&dir);
+
+    owner.kill9();
+    let gone = wait_until(Duration::from_secs(15), || !alive(pm) && !Path::new(&dir).exists());
+    let forked_alive = alive(forked);
+    signal("-KILL", forked);
+    assert!(forked_alive, "the forked child should still have been running");
+    assert!(gone, "a forked child's copy of the watchdog socket kept the server up");
 }

@@ -40,6 +40,9 @@ impl Error {
 
         match code {
             rustypglite_sys::RPGL_ERR_INIT => Error::Init(msg),
+            rustypglite_sys::RPGL_ERR_ALREADY => {
+                Error::Start("a server is already running in that data dir".into())
+            }
             rustypglite_sys::RPGL_ERR_START => Error::Start(msg),
             rustypglite_sys::RPGL_ERR_STOP => Error::Stop(msg),
             rustypglite_sys::RPGL_ERR_INTERNAL => Error::Internal(msg),

@@ -277,7 +277,7 @@ public class LifecycleTests
 
         Assert.Equal(1, report.Reclaimed); // B
         Assert.Equal(1, report.Live);      // A
-        Assert.Equal(1, report.Durable);   // C
+        Assert.Equal(0, report.Durable);   // C is rpgldur_*: outside the sweep altogether
         Assert.Equal(1, report.Legacy);    // D
         Assert.Equal(0, report.Failed);
 
