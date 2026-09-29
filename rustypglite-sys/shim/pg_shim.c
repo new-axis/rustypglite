@@ -1213,16 +1213,27 @@ static int start_impl(const rpgl_options *opts, rpgl_instance **out, int *dir_lo
          * Hold an exclusive lock on the dir for the whole start, so two
          * starts racing on it cannot both pass the check below — and the
          * loser's failure path cannot stop the winner's server.  Created if
-         * missing (initdb accepts an existing empty dir); close-on-exec, so
-         * neither pg_ctl nor postgres inherits it.
+         * missing, parents included, as initdb used to (it accepts an
+         * existing empty dir); close-on-exec, so neither pg_ctl nor postgres
+         * inherits it.  Only a lock someone else holds means "already
+         * running"; failing to create, open or lock the dir is a setup error.
          */
-        mkdir(opts->data_dir, 0700);
+        char mk[4096];
+        snprintf(mk, sizeof(mk), "%s", opts->data_dir);
+        for (char *p = mk + 1; *p; p++) {
+            if (*p != '/') continue;
+            *p = '\0';
+            mkdir(mk, 0700);          /* EEXIST is fine; a real failure shows at open() */
+            *p = '/';
+        }
+        mkdir(mk, 0700);
         *dir_lock = open(opts->data_dir, O_RDONLY | O_CLOEXEC);
         if (*dir_lock < 0 || flock(*dir_lock, LOCK_EX | LOCK_NB) != 0) {
+            int busy = *dir_lock >= 0 && errno == EWOULDBLOCK;
             free(inst->pg_bin_dir);
             free(inst->db_name);
             free(inst);
-            return RPGL_ERR_ALREADY;
+            return busy ? RPGL_ERR_ALREADY : RPGL_ERR_INIT;
         }
         /*
          * A server is already running here (someone else's, or a durable one

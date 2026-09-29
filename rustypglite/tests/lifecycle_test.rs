@@ -648,3 +648,36 @@ fn a_forked_child_that_lives_on_does_not_keep_the_server_up() {
     assert!(forked_alive, "the forked child should still have been running");
     assert!(gone, "a forked child's copy of the watchdog socket kept the server up");
 }
+
+#[test]
+fn a_data_dir_with_missing_parents_starts_and_an_unwritable_one_is_an_init_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new("parents");
+
+    // Missing parents are created, as initdb used to create them.
+    let deep = root.0.join("a/b/db");
+    let pg = EmbeddedPg::start_with(StartOptions {
+        data_dir: Some(deep.to_str().unwrap().to_string()),
+        temp_root: Some(root.path().to_string()),
+        silent: true,
+        ..Default::default()
+    })
+    .expect("a data dir whose parents do not exist yet starts");
+    pg.exec_sql("SELECT 1").expect("serving");
+    pg.stop();
+
+    // A parent we cannot write to is a setup problem, not "already running".
+    let locked = root.0.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let err = EmbeddedPg::start_with(StartOptions {
+        data_dir: Some(locked.join("x/db").to_str().unwrap().to_string()),
+        temp_root: Some(root.path().to_string()),
+        silent: true,
+        ..Default::default()
+    })
+    .err()
+    .expect("an unwritable parent cannot start");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(err, rustypglite::Error::Init(_)), "expected Init, got {:?}", err);
+}
