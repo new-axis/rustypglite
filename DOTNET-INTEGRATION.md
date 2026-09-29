@@ -138,11 +138,48 @@ public class DatabaseFixture : IAsyncLifetime
 }
 ```
 
+## Servers never outlive your process
+
+`Dispose()` stops the server and removes its data directory. If the process
+never gets that far — `dotnet test` is cancelled, the test host is killed,
+the debugger is stopped, anything up to `kill -9` — a watchdog started
+alongside the server stops it and removes the directory within a second or
+two. Every `Start()` also sweeps away servers whose owning process is
+provably dead (see [ARCHITECTURE.md](ARCHITECTURE.md#ownership-why-no-server-outlives-its-owner)).
+Nothing in your test code has to change for this.
+
+A server that must outlive the process — a local dev database — must say so:
+
+```csharp
+var pg = EmbeddedPg.Start(new EmbeddedPgOptions { Durable = true, DataDir = "/home/me/.devdb" });
+// Dispose() only lets go of a durable server; it keeps running.
+// End it with pg.Stop(), or later, from anywhere:
+EmbeddedPg.StopDir("/home/me/.devdb");       // or: rustypglite stop /home/me/.devdb
+```
+
 ## API reference
 
 ```csharp
 // Start with defaults (temp dir, random port, silent)
 using var pg = EmbeddedPg.Start();
+
+// Start with options (all optional)
+using var pg2 = EmbeddedPg.Start(new EmbeddedPgOptions
+{
+    DataDir = null,     // null = fresh /tmp/rpgl_xxx, removed on stop
+    DbName = "myapp",
+    Port = null,        // null = a free port
+    KeepData = false,
+    Durable = false,    // true = not bound to this process, never swept
+    TempRoot = null,    // where auto dirs go and the sweep looks; null = $RUSTYPGLITE_TMPDIR, else /tmp
+});
+
+// Ending it
+pg.Dispose();   // stops it (a durable server: only lets go)
+pg.Stop();      // stops it, durable or not
+pg.Detach();    // lets go without stopping
+EmbeddedPg.StopDir("/tmp/rpgl_xxx");         // stop by data dir, from any process
+SweepReport? r = EmbeddedPg.Sweep();         // reclaim dead owners' servers now; null if busy
 
 // Properties
 pg.ConnectionString  // "host=/tmp/rpgl_xxx;port=NNNNN;database=postgres;username=postgres"

@@ -193,6 +193,44 @@ epg.execSql('CREATE TABLE ...', 'myapp');  // on specific database
 
 // Stop server, delete data directory
 epg.stop();
+
+// Options (all optional)
+const pg2 = EmbeddedPg.start({
+  dataDir: undefined,  // default: fresh /tmp/rpgl_xxx, removed on stop
+  dbName: 'myapp',
+  port: undefined,     // default: a free port
+  keepData: false,
+  durable: false,      // true = not bound to this process, never swept
+  tempRoot: undefined, // where auto dirs go and the sweep looks; default $RUSTYPGLITE_TMPDIR, else /tmp
+});
+pg2.detach();          // let go without stopping
+// using pg3 = EmbeddedPg.start();  → [Symbol.dispose] stops it (a durable one: detaches)
+
+// Stop by data dir from any process, and sweep
+import { stopDir, sweep } from 'rustypglite';
+stopDir('/tmp/rpgl_xxx');
+sweep();               // → { examined, reclaimed, live, durable, legacy, skipped, failed } | null if busy
+```
+
+### Servers never outlive your process
+
+`stop()` stops the server and removes its data directory. If the process
+never gets that far — vitest is interrupted, a worker is killed, anything up
+to `kill -9` — a watchdog started alongside the server stops it and removes
+the directory within a second or two. Every `start()` also sweeps away
+servers whose owning process is provably dead (see
+[ARCHITECTURE.md](ARCHITECTURE.md#ownership-why-no-server-outlives-its-owner)).
+
+That includes the shared-server pattern: the server belongs to the process
+that called `start()` (vitest's global setup), and dies with it. Workers that
+`connectExisting()` never stop it — their `stop()` only lets go of the handle.
+
+A server that must outlive the process says so with `{ durable: true }`, and
+is ended explicitly: `epg.stop()`, `stopDir(dir)`, or from a shell:
+
+```bash
+npx rustypglite stop /tmp/rpgl_xxx
+npx rustypglite sweep [--root <dir>]
 ```
 
 ### Connecting with pg Pool
